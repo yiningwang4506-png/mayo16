@@ -196,3 +196,4 @@ class TrainTask(object):
         img[img > cut_max] = cut_max
         img = (img - cut_min) / (cut_max - cut_min)
         return img
+

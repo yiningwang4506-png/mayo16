@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 import copy
 from einops import rearrange
-from utils.drl_loss import DRL_Loss
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -53,25 +53,14 @@ class up(nn.Module):
 
 
 class outconv(nn.Module):
-    def __init__(self, in_ch, out_ch, n_bins=19):
+    def __init__(self, in_ch, out_ch):
         super(outconv, self).__init__()
-        self.n_bins = n_bins
-        # 输出19个通道（对应19个bins）
-        self.conv = nn.Conv2d(in_ch, n_bins, 1)
-        self.softmax = nn.Softmax(dim=1)
-        # 定义bins: [-160, -140, ..., 200]
-        self.register_buffer('bins', torch.linspace(-160, 200, n_bins))
+        self.conv = nn.Conv2d(in_ch, out_ch, 1)
 
     def forward(self, x):
-        # 输出分布
-        distribution = self.conv(x)  # [B, 19, H, W]
-        # 转换为概率
-        probabilities = self.softmax(distribution)  # [B, 19, H, W]
-        # 加权求和得到预测值
-        bins = self.bins.view(1, -1, 1, 1)  # [1, 19, 1, 1]
-        prediction = torch.sum(probabilities * bins, dim=1, keepdim=True)  # [B, 1, H, W]
-        
-        return prediction, probabilities
+        x = self.conv(x)
+        return x
+
 
 class adjust_net(nn.Module):
     def __init__(self, out_channels=64, middle_channels=32):
@@ -172,7 +161,7 @@ class UNet(nn.Module):
             single_conv(64, 64)
         )
 
-        self.outc = outconv(64, out_channels, n_bins=19)
+        self.outc = outconv(64, out_channels)
 
     def forward(self, x, t, x_adjust, adjust):
         inx = self.inc(x)
@@ -221,8 +210,8 @@ class UNet(nn.Module):
             up2 = up2 + condition4
         conv4 = self.conv4(up2)
 
-        prediction, probabilities = self.outc(conv4)
-        return prediction, probabilities
+        out = self.outc(conv4)
+        return out
 
 
 class Network(nn.Module):
@@ -238,9 +227,9 @@ class Network(nn.Module):
             x_middle = x
         
         x_adjust = torch.cat((y, x_end), dim=1)
-        prediction, probabilities = self.unet(x, t, x_adjust, adjust=adjust)
-        out = prediction + x_middle
-        return out, probabilities
+        out = self.unet(x, t, x_adjust, adjust=adjust) + x_middle
+
+        return out
 
 
 # WeightNet of the one-shot learning framework

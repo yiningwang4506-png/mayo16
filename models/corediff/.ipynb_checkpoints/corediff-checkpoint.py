@@ -8,8 +8,6 @@ import copy
 from utils.measure import *
 from utils.loss_function import PerceptualLoss
 from utils.ema import EMA
-import torch.nn as nn
-from utils.drl_loss import DRL_Loss
 
 from models.basic_template import TrainTask
 from .corediff_wrapper import Network, WeightNet
@@ -48,7 +46,15 @@ class corediff(TrainTask):
         self.sampling_routine = opt.sampling_routine
         self.context = opt.context
         
-        denoise_fn = Network(in_channels=opt.in_channels, context=opt.context)
+        if opt.context:
+            in_channels = 5
+        else:
+            in_channels = 3
+        
+        denoise_fn = Network(in_channels=in_channels, context=opt.context)
+
+        
+        
 
         model = Diffusion(
             denoise_fn=denoise_fn,
@@ -65,8 +71,8 @@ class corediff(TrainTask):
         self.optimizer = optimizer
         self.ema_model = ema_model
 
-        self.lossfn = DRL_Loss(n_bins=19, y_min=-160, y_max=200, lambda_df=0.02)
-        self.lossfn_sub1 = DRL_Loss(n_bins=19, y_min=-160, y_max=200, lambda_df=0.02)
+        self.lossfn = nn.MSELoss()
+        self.lossfn_sub1 = nn.MSELoss()
 
         self.reset_parameters()
     
@@ -90,14 +96,13 @@ class corediff(TrainTask):
         low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
 
         ## training process of CoreDiff
-        (gen_full_dose, probs), x_mix, (gen_full_dose_sub1, probs_sub1), x_mix_sub1 = self.model(
+        gen_full_dose, x_mix, gen_full_dose_sub1, x_mix_sub1 = self.model(
             low_dose, full_dose, n_iter,
             only_adjust_two_step=opt.only_adjust_two_step,
             start_adjust_iter=opt.start_adjust_iter
         )
 
-        loss = 0.5 * self.lossfn(gen_full_dose, probs, full_dose) + \
-               0.5 * self.lossfn_sub1(gen_full_dose_sub1, probs_sub1, full_dose)
+        loss = 0.5 * self.lossfn(gen_full_dose, full_dose) + 0.5 * self.lossfn_sub1(gen_full_dose_sub1, full_dose)
         loss.backward()
 
         if opt.wandb:
@@ -127,7 +132,7 @@ class corediff(TrainTask):
         for low_dose, full_dose in tqdm.tqdm(self.test_loader, desc='test'):
             low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
 
-            (gen_full_dose, _), direct_recons, imstep_imgs = self.ema_model.sample(
+            gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
                 img = low_dose,
                 t = self.T,
@@ -157,7 +162,7 @@ class corediff(TrainTask):
         self.ema_model.eval()
         low_dose, full_dose = self.test_images
 
-        (gen_full_dose, _), direct_recons, imstep_imgs = self.ema_model.sample(
+        gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
                 img = low_dose,
                 t = self.T,
@@ -196,7 +201,7 @@ class corediff(TrainTask):
                     low_dose, full_dose = self.test_dataset[i]
         low_dose, full_dose = torch.from_numpy(low_dose).unsqueeze(0).cuda(), torch.from_numpy(full_dose).unsqueeze(0).cuda()
 
-        (gen_full_dose, _), direct_recons, imstep_imgs = self.ema_model.sample(
+        gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
             batch_size=low_dose.shape[0],
             img=low_dose,
             t=self.T,
@@ -271,7 +276,7 @@ class corediff(TrainTask):
         for low_dose, full_dose in tqdm.tqdm(self.test_loader, desc='test'):
             low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
 
-            (gen_full_dose, _), direct_recons, imstep_imgs = self.ema_model.sample(
+            gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size=low_dose.shape[0],
                 img=low_dose,
                 t=self.T,
