@@ -1,0 +1,23 @@
+# 忽略数据文件和大模型
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.mat
+
+# 忽略输出和日志
+output/
+logs/
+*.log
+
+# 缓存
+__pycache__/
+*.pyc
+
+# IDE / 环境
+.vscode/
+.idea/
+.env
+venv/
