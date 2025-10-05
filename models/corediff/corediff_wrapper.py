@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 import copy
 from einops import rearrange
-from utils.drl_loss import DRL_Loss
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -53,25 +53,14 @@ class up(nn.Module):
 
 
 class outconv(nn.Module):
-    def __init__(self, in_ch, out_ch, n_bins=19):
+    def __init__(self, in_ch, out_ch):
         super(outconv, self).__init__()
-        self.n_bins = n_bins
-        # 输出19个通道（对应19个bins）
-        self.conv = nn.Conv2d(in_ch, n_bins, 1)
-        self.softmax = nn.Softmax(dim=1)
-        # 定义bins: [-160, -140, ..., 200]
-        self.register_buffer('bins', torch.linspace(-160, 200, n_bins))
+        self.conv = nn.Conv2d(in_ch, out_ch, 1)
 
     def forward(self, x):
-        # 输出分布
-        distribution = self.conv(x)  # [B, 19, H, W]
-        # 转换为概率
-        probabilities = self.softmax(distribution)  # [B, 19, H, W]
-        # 加权求和得到预测值
-        bins = self.bins.view(1, -1, 1, 1)  # [1, 19, 1, 1]
-        prediction = torch.sum(probabilities * bins, dim=1, keepdim=True)  # [B, 1, H, W]
-        
-        return prediction, probabilities
+        x = self.conv(x)
+        return x
+
 
 class adjust_net(nn.Module):
     def __init__(self, out_channels=64, middle_channels=32):
@@ -101,13 +90,25 @@ class adjust_net(nn.Module):
         return out1, out2
 
 
- # The architecture of U-Net refers to "Toward Convolutional Blind Denoising of Real Photographs",
- # official MATLAB implementation: https://github.com/GuoShi28/CBDNet.
- # unofficial PyTorch implementation: https://github.com/IDKiro/CBDNet-pytorch/tree/master.
- # We improved it by adding time step embedding and EMM module, while removing the noise estimation network.
+# The architecture of U-Net refers to "Toward Convolutional Blind Denoising of Real Photographs",
+# official MATLAB implementation: https://github.com/GuoShi28/CBDNet.
+# unofficial PyTorch implementation: https://github.com/IDKiro/CBDNet-pytorch/tree/master.
+# We improved it by adding time step embedding and EMM module, while removing the noise estimation network.
 class UNet(nn.Module):
-    def __init__(self, in_channels=2, out_channels=1):
+    def __init__(self, in_channels=2, out_channels=1,
+                 reg_max=18,
+                 y_0=-160.0,
+                 y_n=200.0,
+                 norm_range_max=3072.0,
+                 norm_range_min=-1024.0):
         super(UNet, self).__init__()
+
+        # DRL parameters
+        self.reg_max = reg_max
+        self.y_0 = y_0
+        self.y_n = y_n
+        self.norm_range_max = norm_range_max
+        self.norm_range_min = norm_range_min
 
         dim = 32
         self.time_mlp = nn.Sequential(
@@ -172,7 +173,19 @@ class UNet(nn.Module):
             single_conv(64, 64)
         )
 
-        self.outc = outconv(64, out_channels, n_bins=19)
+        # DRL output layer: output reg_max+1 channels instead of out_channels
+        self.outc = outconv(64, self.reg_max + 1)
+        
+        # Initialize bias to 1.0 to help convergence
+        self.outc.conv.bias.data[:] = 1.0
+        
+        # Create projection vector (normalized to [0,1] range)
+        proj = torch.linspace(y_0, y_n, self.reg_max + 1, dtype=torch.float)
+        proj = proj / (norm_range_max - norm_range_min)
+        self.register_buffer('proj', proj, persistent=False)
+        
+        # HU interval
+        self.hu_interval = (y_n - y_0) / self.reg_max
 
     def forward(self, x, t, x_adjust, adjust):
         inx = self.inc(x)
@@ -221,15 +234,44 @@ class UNet(nn.Module):
             up2 = up2 + condition4
         conv4 = self.conv4(up2)
 
-        prediction, probabilities = self.outc(conv4)
-        return prediction, probabilities
+        # DRL output transformation
+        out = self.outc(conv4)  # shape: (B, reg_max+1, H, W)
+        
+        # Permute to (B, H, W, reg_max+1) for softmax and matmul
+        out_dist = out.permute(0, 2, 3, 1)
+        
+        # Apply softmax along the distribution dimension and project back to continuous value
+        out = out_dist.softmax(3).matmul(self.proj.view([-1, 1]))  # shape: (B, H, W, 1)
+        
+        # Permute back to (B, 1, H, W)
+        out = out.permute(0, 3, 1, 2)
+        
+        return out, out_dist
 
 
 class Network(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, context=True):
+    def __init__(self, in_channels=3, out_channels=1, context=True,
+                 reg_max=18,
+                 y_0=-160.0,
+                 y_n=200.0,
+                 norm_range_max=3072.0,
+                 norm_range_min=-1024.0):
         super(Network, self).__init__()
-        self.unet = UNet(in_channels=in_channels, out_channels=out_channels)
+        self.unet = UNet(in_channels=in_channels, 
+                        out_channels=out_channels,
+                        reg_max=reg_max,
+                        y_0=y_0,
+                        y_n=y_n,
+                        norm_range_max=norm_range_max,
+                        norm_range_min=norm_range_min)
         self.context = context
+        
+        # Expose DRL parameters for loss computation
+        self.reg_max = reg_max
+        self.hu_interval = self.unet.hu_interval
+        self.y_0 = y_0
+        self.norm_range_max = norm_range_max
+        self.norm_range_min = norm_range_min
 
     def forward(self, x, t, y, x_end, adjust=True):
         if self.context:
@@ -238,9 +280,10 @@ class Network(nn.Module):
             x_middle = x
         
         x_adjust = torch.cat((y, x_end), dim=1)
-        prediction, probabilities = self.unet(x, t, x_adjust, adjust=adjust)
-        out = prediction + x_middle
-        return out, probabilities
+        out, out_dist = self.unet(x, t, x_adjust, adjust=adjust)
+        out = out + x_middle  # Residual connection
+
+        return out, out_dist
 
 
 # WeightNet of the one-shot learning framework

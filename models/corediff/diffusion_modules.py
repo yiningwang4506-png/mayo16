@@ -83,6 +83,8 @@ class Diffusion(nn.Module):
                 else:
                     adjust = True
 
+                # denoise_fn now returns (x1_bar, out_dist)
+                # We only need x1_bar for sampling
                 x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust)
                 x2_bar = self.get_x2_bar_from_xt(x1_bar, img, step)
 
@@ -115,6 +117,8 @@ class Diffusion(nn.Module):
                 else:
                     adjust = True
 
+                # denoise_fn now returns (x1_bar, out_dist)
+                # We only need x1_bar for sampling
                 x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust)
                 x2_bar = noise
 
@@ -133,16 +137,25 @@ class Diffusion(nn.Module):
                 imstep_imgs.append(img)
                 t = t - 1
 
-        return (img.clamp(0., 1.), None), torch.stack(direct_recons), torch.stack(imstep_imgs)
+        return img.clamp(0., 1.), torch.stack(direct_recons), torch.stack(imstep_imgs)
 
 
     def forward(self, x, y, n_iter, only_adjust_two_step=False, start_adjust_iter=1):
         '''
-        :param x: low dose image
-        :param y: ground truth image
-        :param n_iter: trainging iteration
-        :param only_adjust_two_step: only use the EMM module in the second stage. Default: True
+        Training forward pass with DRL support
+        :param x: low dose image (B, C, H, W) where C=3 if context else C=1
+        :param y: ground truth image (B, 1, H, W)
+        :param n_iter: training iteration
+        :param only_adjust_two_step: only use the EMM module in the second stage. Default: False
         :param start_adjust_iter: the number of iterations to start training the EMM module. Default: 1
+        
+        Returns:
+            x_recon: (B, 1, H, W) - stage I prediction
+            x_mix: (B, C, H, W) - stage I mixed input
+            x_recon_sub1: (B, 1, H, W) - stage II prediction
+            x_mix_sub1: (B, C, H, W) - stage II mixed input
+            out_dist_1: (B, H, W, reg_max+1) - stage I distribution
+            out_dist_2: (B, H, W, reg_max+1) - stage II distribution
         '''
 
         b, c, h, w, device, img_size, = *y.shape, y.device, self.image_size
@@ -152,37 +165,46 @@ class Diffusion(nn.Module):
         t = t_single.repeat((b,))
         
         if self.context:
-            x_end = x[:,1].unsqueeze(1)
-            x_mix = self.q_sample(x_start=y, x_end=x_end, t=t)
-            x_mix = torch.cat((x[:,0].unsqueeze(1), x_mix, x[:,2].unsqueeze(1)), dim=1)
+            # x: (B, 3, H, W) -> extract middle slice as x_end
+            x_end = x[:, 1].unsqueeze(1)  # (B, 1, H, W)
+            x_mix = self.q_sample(x_start=y, x_end=x_end, t=t)  # (B, 1, H, W)
+            # Concatenate with context slices
+            x_mix = torch.cat((x[:, 0].unsqueeze(1), x_mix, x[:, 2].unsqueeze(1)), dim=1)  # (B, 3, H, W)
         else:
+            # x: (B, 1, H, W)
             x_end = x
-            x_mix = self.q_sample(x_start=y, x_end=x_end, t=t)
+            x_mix = self.q_sample(x_start=y, x_end=x_end, t=t)  # (B, 1, H, W)
 
-        # stage I
+        # Stage I
         if only_adjust_two_step or n_iter < start_adjust_iter:
-            x_recon, probs_recon = self.denoise_fn(x_mix, t, y, x_end, adjust=False)
+            # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
+            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=False)
         else:
             if t[0] == self.num_timesteps - 1:
                 adjust = False
             else:
                 adjust = True
-            x_recon, probs_recon = self.denoise_fn(x_mix, t, y, x_end, adjust=adjust)
+            # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
+            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=adjust)
 
-        # stage II
+        # Stage II
         if n_iter >= start_adjust_iter and t_single.item() >= 1:
             t_sub1 = t - 1
             t_sub1[t_sub1 < 0] = 0
 
             if self.context:
-                x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)
-                x_mix_sub1 = torch.cat((x[:, 0].unsqueeze(1), x_mix_sub1, x[:, 2].unsqueeze(1)), dim=1)
+                # x_recon: (B, 1, H, W)
+                x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)  # (B, 1, H, W)
+                # Concatenate with context slices
+                x_mix_sub1 = torch.cat((x[:, 0].unsqueeze(1), x_mix_sub1, x[:, 2].unsqueeze(1)), dim=1)  # (B, 3, H, W)
             else:
-                x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)
+                x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)  # (B, 1, H, W)
 
-            x_recon_sub1, probs_recon_sub1 = self.denoise_fn(x_mix_sub1, t_sub1, x_recon, x_end, adjust=True)
+            # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
+            x_recon_sub1, out_dist_2 = self.denoise_fn(x_mix_sub1, t_sub1, x_recon, x_end, adjust=True)
         else:
             x_recon_sub1, x_mix_sub1 = x_recon, x_mix
-            probs_recon_sub1 = probs_recon
+            out_dist_2 = out_dist_1
 
-        return (x_recon, probs_recon), x_mix, (x_recon_sub1, probs_recon_sub1), x_mix_sub1
+        # Return 6 values: predictions, mixed inputs, and distributions
+        return x_recon, x_mix, x_recon_sub1, x_mix_sub1, out_dist_1, out_dist_2

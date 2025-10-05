@@ -1,15 +1,15 @@
 import os.path as osp
 from torch.nn import functional as F
 import torch
+import torch.nn as nn
 import torchvision
 import argparse
 import tqdm
 import copy
+import numpy as np
 from utils.measure import *
 from utils.loss_function import PerceptualLoss
 from utils.ema import EMA
-import torch.nn as nn
-from utils.drl_loss import DRL_Loss
 
 from models.basic_template import TrainTask
 from .corediff_wrapper import Network, WeightNet
@@ -36,6 +36,22 @@ class corediff(TrainTask):
         parser.add_argument('--only_adjust_two_step', action='store_true')
         parser.add_argument('--start_adjust_iter', default=1, type=int)
         
+        # DRL parameters
+        parser.add_argument('--reg_max', default=18, type=int,
+                          help='Number of discrete bins for DRL (default: 18, total 19 bins)')
+        parser.add_argument('--y_0', default=-160.0, type=float,
+                          help='Minimum HU value for DRL range')
+        parser.add_argument('--y_n', default=200.0, type=float,
+                          help='Maximum HU value for DRL range')
+        parser.add_argument('--norm_range_max', default=3072.0, type=float,
+                          help='Maximum value for normalization')
+        parser.add_argument('--norm_range_min', default=-1024.0, type=float,
+                          help='Minimum value for normalization')
+        parser.add_argument('--use_dfl_loss', action='store_true',
+                          help='Use Distribution Focal Loss')
+        parser.add_argument('--dfl_weight', default=0.2, type=float,
+                          help='Weight for DFL loss')
+        
         return parser
 
     def set_model(self):
@@ -48,7 +64,15 @@ class corediff(TrainTask):
         self.sampling_routine = opt.sampling_routine
         self.context = opt.context
         
-        denoise_fn = Network(in_channels=opt.in_channels, context=opt.context)
+        denoise_fn = Network(
+            in_channels=opt.in_channels, 
+            context=opt.context,
+            reg_max=opt.reg_max,
+            y_0=opt.y_0,
+            y_n=opt.y_n,
+            norm_range_max=opt.norm_range_max,
+            norm_range_min=opt.norm_range_min
+        )
 
         model = Diffusion(
             denoise_fn=denoise_fn,
@@ -65,8 +89,17 @@ class corediff(TrainTask):
         self.optimizer = optimizer
         self.ema_model = ema_model
 
-        self.lossfn = DRL_Loss(n_bins=19, y_min=-160, y_max=200, lambda_df=0.02)
-        self.lossfn_sub1 = DRL_Loss(n_bins=19, y_min=-160, y_max=200, lambda_df=0.02)
+        self.lossfn = nn.MSELoss()
+        self.lossfn_sub1 = nn.MSELoss()
+        
+        # DRL parameters for DFL loss
+        self.use_dfl_loss = opt.use_dfl_loss
+        self.dfl_weight = opt.dfl_weight
+        self.reg_max = opt.reg_max
+        self.hu_interval = denoise_fn.hu_interval
+        self.y_0 = opt.y_0
+        self.norm_range_max = opt.norm_range_max
+        self.norm_range_min = opt.norm_range_min
 
         self.reset_parameters()
     
@@ -81,6 +114,75 @@ class corediff(TrainTask):
             return
         self.ema.update_model_average(self.ema_model, self.model)
 
+    
+    def compute_dfl_loss(self, out_dist, y, x):
+        """
+        计算Distribution Focal Loss
+        
+        Args:
+            out_dist: (B, 19, H, W) 网络输出的分布logits
+            y: (B, 1, H, W) 全剂量CT图像 [0,1]
+            x: (B, 1, H, W) 低剂量CT图像 [0,1]
+        """
+        
+        # ================== 步骤1: HU空间转换 ==================
+        x_HU = x * 4096.0 - 1024.0
+        y_HU = y * 4096.0 - 1024.0
+        residual_HU = y_HU - x_HU
+        
+        print("\n" + "="*60)
+        print("🔍 DFL Loss 诊断信息")
+        print("="*60)
+        print(f"📊 残差HU统计:")
+        print(f"   范围: [{residual_HU.min().item():.1f}, {residual_HU.max().item():.1f}] HU")
+        print(f"   均值±标准差: {residual_HU.mean().item():.1f} ± {residual_HU.std().item():.1f} HU")
+        
+        # ================== 步骤2: 离散化到Bin ==================
+        bin_idx_raw = (residual_HU - self.y_0) / self.hu_interval
+        bin_idx = torch.clamp(bin_idx_raw, 0, self.reg_max)
+        
+        out_of_range = ((bin_idx_raw < 0) | (bin_idx_raw > self.reg_max)).float()
+        out_ratio = out_of_range.mean().item() * 100
+        
+        print(f"\n📍 Bin索引统计:")
+        print(f"   范围: [{bin_idx.min().item():.2f}, {bin_idx.max().item():.2f}]")
+        print(f"   越界比例: {out_ratio:.1f}% (应该<5%)")
+        
+        # ================== 步骤3: 生成目标分布 ==================
+        B, C, H, W = bin_idx.shape
+        bin_idx_flat = bin_idx.reshape(-1)
+        
+        left = bin_idx_flat.floor().long()
+        right = torch.clamp(left + 1, max=self.reg_max)
+        weight_right = bin_idx_flat - left.float()
+        
+        target_dist_flat = torch.zeros(bin_idx_flat.shape[0], self.reg_max + 1, device=bin_idx.device)
+        target_dist_flat.scatter_(1, left.unsqueeze(1), (1 - weight_right).unsqueeze(1))
+        target_dist_flat.scatter_(1, right.unsqueeze(1), weight_right.unsqueeze(1))
+        
+        # ================== 步骤4: 网络预测分布 ==================
+        pred_dist = torch.softmax(out_dist, dim=1)  # (B, 19, H, W)
+        pred_dist_flat = pred_dist.permute(0, 2, 3, 1).reshape(-1, self.reg_max + 1)
+        
+        entropy = -(pred_dist_flat * torch.log(pred_dist_flat + 1e-8)).sum(-1).mean()
+        max_prob = pred_dist_flat.max(-1)[0].mean()
+        
+        print(f"\n🎯 预测分布统计:")
+        print(f"   熵: {entropy.item():.3f} (随机分布=2.944, 越小越好)")
+        print(f"   最大概率均值: {max_prob.item():.3f} (随机=0.053, 越大越好)")
+        
+        # ================== 步骤5: 计算损失 ==================
+        B_out, C_out, H_out, W_out = out_dist.shape
+        out_dist_flat = out_dist.permute(0, 2, 3, 1).reshape(-1, self.reg_max + 1)
+        
+        loss = -(target_dist_flat * torch.log_softmax(out_dist_flat, dim=-1)).sum(-1).mean()
+        loss = loss * 0.0001
+        print(f"\n💰 DFL Loss: {loss.item():.4f}")
+        print(f"   期望初始值: ~2.94 (随机猜测)")
+        print(f"   期望训练后: <0.5")
+        print("="*60 + "\n")
+        
+        return loss
 
     def train(self, inputs, n_iter):
         opt = self.opt
@@ -89,15 +191,51 @@ class corediff(TrainTask):
         low_dose, full_dose = inputs
         low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
 
-        ## training process of CoreDiff
-        (gen_full_dose, probs), x_mix, (gen_full_dose_sub1, probs_sub1), x_mix_sub1 = self.model(
+        ## Training process of CoreDiff with DRL
+        # Returns: gen_full_dose, x_mix, gen_full_dose_sub1, x_mix_sub1, out_dist_1, out_dist_2
+        gen_full_dose, x_mix, gen_full_dose_sub1, x_mix_sub1, out_dist_1, out_dist_2 = self.model(
             low_dose, full_dose, n_iter,
             only_adjust_two_step=opt.only_adjust_two_step,
             start_adjust_iter=opt.start_adjust_iter
         )
 
-        loss = 0.5 * self.lossfn(gen_full_dose, probs, full_dose) + \
-               0.5 * self.lossfn_sub1(gen_full_dose_sub1, probs_sub1, full_dose)
+        # MSE loss
+        loss_mse = 0.5 * self.lossfn(gen_full_dose, full_dose) + \
+                   0.5 * self.lossfn_sub1(gen_full_dose_sub1, full_dose)
+        
+        loss = loss_mse
+        
+        # DFL loss (optional)
+        if self.use_dfl_loss:
+        # Get the middle slice if using context
+            if self.context:
+                x_middle = low_dose[:, 1].unsqueeze(1)
+            else:
+                x_middle = low_dose
+        
+            # Calculate DFL loss for both stages
+            loss_dfl_1 = self.compute_dfl_loss(out_dist_1, full_dose, x_middle)
+            loss_dfl_2 = self.compute_dfl_loss(out_dist_2, full_dose, x_middle)
+            loss_dfl = 0.5 * loss_dfl_1 + 0.5 * loss_dfl_2
+            
+            loss = loss_mse + self.dfl_weight * loss_dfl
+            
+            # 添加这些检查（在backward之前）
+            if n_iter % 100 == 1:  # 每100步打印一次
+                print(f"\n{'='*60}")
+                print(f"[梯度检查 - Iter {n_iter}]")
+                print(f"{'='*60}")
+                print(f"out_dist_1.requires_grad: {out_dist_1.requires_grad}")
+                print(f"out_dist_2.requires_grad: {out_dist_2.requires_grad}")
+                print(f"loss_dfl_1.requires_grad: {loss_dfl_1.requires_grad}")
+                print(f"loss_dfl_2.requires_grad: {loss_dfl_2.requires_grad}")
+                print(f"loss_dfl.requires_grad: {loss_dfl.requires_grad}")
+                print(f"loss.requires_grad: {loss.requires_grad}")
+                print(f"loss_mse value: {loss_mse.item():.8f}")
+                print(f"loss_dfl value: {loss_dfl.item():.8f}")
+                print(f"total loss value: {loss.item():.8f}")
+                print(f"{'='*60}\n")
+
         loss.backward()
 
         if opt.wandb:
@@ -108,11 +246,18 @@ class corediff(TrainTask):
         self.optimizer.zero_grad()
 
         lr = self.optimizer.param_groups[0]['lr']
-        loss = loss.item()
-        self.logger.msg([loss, lr], n_iter)
+        loss_value = loss.item()
+        
+        if self.use_dfl_loss:
+            self.logger.msg([loss_value, loss_mse.item(), loss_dfl.item(), lr], n_iter)
+        else:
+            self.logger.msg([loss_value, lr], n_iter)
 
         if opt.wandb:
-            wandb.log({'epoch': n_iter, 'loss': loss})
+            log_dict = {'epoch': n_iter, 'loss': loss_value, 'loss_mse': loss_mse.item()}
+            if self.use_dfl_loss:
+                log_dict['loss_dfl'] = loss_dfl.item()
+            wandb.log(log_dict)
 
         if n_iter % self.update_ema_iter == 0:
             self.step_ema(n_iter)
@@ -127,7 +272,7 @@ class corediff(TrainTask):
         for low_dose, full_dose in tqdm.tqdm(self.test_loader, desc='test'):
             low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
 
-            (gen_full_dose, _), direct_recons, imstep_imgs = self.ema_model.sample(
+            gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
                 img = low_dose,
                 t = self.T,
@@ -157,7 +302,7 @@ class corediff(TrainTask):
         self.ema_model.eval()
         low_dose, full_dose = self.test_images
 
-        (gen_full_dose, _), direct_recons, imstep_imgs = self.ema_model.sample(
+        gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
                 img = low_dose,
                 t = self.T,
@@ -196,7 +341,7 @@ class corediff(TrainTask):
                     low_dose, full_dose = self.test_dataset[i]
         low_dose, full_dose = torch.from_numpy(low_dose).unsqueeze(0).cuda(), torch.from_numpy(full_dose).unsqueeze(0).cuda()
 
-        (gen_full_dose, _), direct_recons, imstep_imgs = self.ema_model.sample(
+        gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
             batch_size=low_dose.shape[0],
             img=low_dose,
             t=self.T,
@@ -271,7 +416,7 @@ class corediff(TrainTask):
         for low_dose, full_dose in tqdm.tqdm(self.test_loader, desc='test'):
             low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
 
-            (gen_full_dose, _), direct_recons, imstep_imgs = self.ema_model.sample(
+            gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size=low_dose.shape[0],
                 img=low_dose,
                 t=self.T,
@@ -290,20 +435,19 @@ class corediff(TrainTask):
             opt_image = self.transfer_calculate_window(opt_image)
 
             data_range = full_dose.max() - full_dose.min()
-            psnr_ori, ssim_ori, rmse_ori = compute_measure(full_dose, gen_full_dose, data_range)
-            psnr_opt, ssim_opt, rmse_opt = compute_measure(full_dose, opt_image, data_range)
+            psnr_ori_score, ssim_ori_score, rmse_ori_score = compute_measure(full_dose, gen_full_dose, data_range)
+            psnr_opt_score, ssim_opt_score, rmse_opt_score = compute_measure(full_dose, opt_image, data_range)
 
-            psnr_ori += psnr_ori / len(self.test_loader)
-            ssim_ori += ssim_ori / len(self.test_loader)
-            rmse_ori += rmse_ori / len(self.test_loader)
+            psnr_ori += psnr_ori_score / len(self.test_loader)
+            ssim_ori += ssim_ori_score / len(self.test_loader)
+            rmse_ori += rmse_ori_score / len(self.test_loader)
 
-            psnr_opt += psnr_opt / len(self.test_loader)
-            ssim_opt += ssim_opt / len(self.test_loader)
-            rmse_opt += rmse_opt / len(self.test_loader)
+            psnr_opt += psnr_opt_score / len(self.test_loader)
+            ssim_opt += ssim_opt_score / len(self.test_loader)
+            rmse_opt += rmse_opt_score / len(self.test_loader)
 
         self.logger.msg([psnr_ori, ssim_ori, rmse_ori], test_iter)
         self.logger.msg([psnr_opt, ssim_opt, rmse_opt], test_iter)
-
 
 
     def get_patch(self, input_img, target_img, patch_size=256, stride=32):
