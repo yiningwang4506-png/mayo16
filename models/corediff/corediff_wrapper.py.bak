@@ -152,7 +152,7 @@ class UNet(nn.Module):
         # Frequency branch (FCB)
         self.conv2_freq = FCB(
             input_chs=128,
-            output_chs=128,
+            output_chs=64,
             num_rows=128,
             num_cols=128,
             stride=1,
@@ -161,7 +161,7 @@ class UNet(nn.Module):
         
         # Fusion (3 layers)
         self.conv2_fusion = nn.Sequential(
-            single_conv(384, 256),  # 256(spatial) + 128(freq) = 384
+            single_conv(320, 256),  
             single_conv(256, 256),
             single_conv(256, 256)
         )
@@ -228,9 +228,8 @@ class UNet(nn.Module):
         # === FCB Forward ===
         # down2 shape: (B, 128, 128, 128)
         spatial_feat = self.conv2_spatial(down2)  # -> (B, 256, 128, 128)
-        freq_feat = self.conv2_freq(down2)        # -> (B, 128, 128, 128)
-        # 可调权重版本
-        merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)  # -> (B, 384, 128, 128)
+        freq_feat = self.conv2_freq(down2)        # -> (B, 64, 128, 128)
+        merged = torch.cat([spatial_feat, freq_feat], dim=1)  # -> (B, 320, 128, 128)
         conv2 = self.conv2_fusion(merged)         # -> (B, 256, 128, 128)
         # === End FCB Forward ===
 
