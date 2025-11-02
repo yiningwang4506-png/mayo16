@@ -54,7 +54,7 @@ class Diffusion(nn.Module):
 
 
     @torch.no_grad()
-    def sample(self, batch_size=4, img=None, t=None, sampling_routine='ddim', n_iter=1, start_adjust_iter=1):
+    def sample(self, batch_size=4, img=None, t=None, sampling_routine='ddim', n_iter=1, start_adjust_iter=1,dose_value=None):
         self.denoise_fn.eval()
         if t == None:
             t = self.num_timesteps
@@ -85,7 +85,7 @@ class Diffusion(nn.Module):
 
                 # denoise_fn now returns (x1_bar, out_dist)
                 # We only need x1_bar for sampling
-                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust)
+                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, dose_value=dose_value)
                 x2_bar = self.get_x2_bar_from_xt(x1_bar, img, step)
 
                 xt_bar = x1_bar
@@ -119,7 +119,7 @@ class Diffusion(nn.Module):
 
                 # denoise_fn now returns (x1_bar, out_dist)
                 # We only need x1_bar for sampling
-                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust)
+                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, dose_value=dose_value)
                 x2_bar = noise
 
                 xt_bar = x1_bar
@@ -140,7 +140,7 @@ class Diffusion(nn.Module):
         return img.clamp(0., 1.), torch.stack(direct_recons), torch.stack(imstep_imgs)
 
 
-    def forward(self, x, y, n_iter, only_adjust_two_step=False, start_adjust_iter=1):
+    def forward(self, x, y, n_iter, only_adjust_two_step=False, start_adjust_iter=1, dose_value=None):
         '''
         Training forward pass with DRL support
         :param x: low dose image (B, C, H, W) where C=3 if context else C=1
@@ -178,14 +178,15 @@ class Diffusion(nn.Module):
         # Stage I
         if only_adjust_two_step or n_iter < start_adjust_iter:
             # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
-            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=False)
+            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=False, dose_value=dose_value)
         else:
             if t[0] == self.num_timesteps - 1:
                 adjust = False
             else:
                 adjust = True
             # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
-            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=adjust)
+            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=adjust, dose_value=dose_value)
+
 
         # Stage II
         if n_iter >= start_adjust_iter and t_single.item() >= 1:
@@ -201,7 +202,7 @@ class Diffusion(nn.Module):
                 x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)  # (B, 1, H, W)
 
             # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
-            x_recon_sub1, out_dist_2 = self.denoise_fn(x_mix_sub1, t_sub1, x_recon, x_end, adjust=True)
+            x_recon_sub1, out_dist_2 = self.denoise_fn(x_mix_sub1, t_sub1, x_recon, x_end, adjust=True, dose_value=dose_value)
         else:
             x_recon_sub1, x_mix_sub1 = x_recon, x_mix
             out_dist_2 = out_dist_1

@@ -1,0 +1,14 @@
+mayo_2016
+5392
+5392
+mayo_2016
+524
+524
+Traceback (most recent call last):
+  File "main.py", line 17, in <module>
+    model = MODEL(opt)
+  File "/root/autodl-tmp/CoreDiff-main/models/basic_template.py", line 22, in __init__
+    self.set_loader()
+  File "/root/autodl-tmp/CoreDiff-main/models/basic_template.py", line 127, in set_loader
+    low_dose = torch.stack([torch.from_numpy(x[0]) for x in test_images], dim=0).cuda()
+KeyboardInterrupt

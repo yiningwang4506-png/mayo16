@@ -102,13 +102,6 @@ class UNet(nn.Module):
                  norm_range_min=-1024.0):
         super(UNet, self).__init__()
 
-        # 🔥 修改:使用更大的嵌入维度以适配所有层
-        self.dose_embed = nn.Sequential(
-            nn.Linear(1, 128),
-            nn.GELU(),
-            nn.Linear(128, 256)  # 输出256维,足够覆盖最大的condition维度
-        )
-
         # DRL parameters
         self.reg_max = reg_max
         self.y_0 = y_0
@@ -159,7 +152,7 @@ class UNet(nn.Module):
         # Frequency branch (FCB)
         self.conv2_freq = FCB(
             input_chs=128,
-            output_chs=128,
+            output_chs=64,
             num_rows=128,
             num_cols=128,
             stride=1,
@@ -168,7 +161,7 @@ class UNet(nn.Module):
         
         # Fusion (3 layers)
         self.conv2_fusion = nn.Sequential(
-            single_conv(384, 256),  # 256(spatial) + 128(freq) = 384
+            single_conv(320, 256),  
             single_conv(256, 256),
             single_conv(256, 256)
         )
@@ -207,78 +200,59 @@ class UNet(nn.Module):
         
         self.hu_interval = (y_n - y_0) / self.reg_max
 
-    def forward(self, x, t, x_adjust, adjust, dose_value): 
+    def forward(self, x, t, x_adjust, adjust):
         inx = self.inc(x)
         time_emb = self.time_mlp(t)
         
-        # 🔥 生成基础剂量嵌入 [B, 256]
-        dose_base = self.dose_embed(dose_value.view(-1, 1))
-        dose_base = dose_base * 2.0
         down1 = self.down1(inx)
         condition1 = self.mlp1(time_emb)
-
-        b, c = condition1.shape  # c=64
+        b, c = condition1.shape
         condition1 = rearrange(condition1, 'b c -> b c 1 1')
-        
-        # 🔥 动态截取dose_emb以匹配condition1的通道数
-        dose_emb1 = dose_base[:, :c].unsqueeze(-1).unsqueeze(-1)  # [B, 64, 1, 1]
-        
         if adjust:
             gamma1, beta1 = self.adjust1(x_adjust)
-            down1 = down1 + gamma1 * condition1 + beta1 + dose_emb1
+            down1 = down1 + gamma1 * condition1 + beta1
         else:
-            down1 = down1 + condition1 + dose_emb1
+            down1 = down1 + condition1
         conv1 = self.conv1(down1)
 
         down2 = self.down2(conv1)
         condition2 = self.mlp2(time_emb)
-        b, c = condition2.shape  # c=128
+        b, c = condition2.shape
         condition2 = rearrange(condition2, 'b c -> b c 1 1')
-        
-        # 🔥 动态截取dose_emb以匹配condition2的通道数
-        dose_emb2 = dose_base[:, :c].unsqueeze(-1).unsqueeze(-1)  # [B, 128, 1, 1]
-        
         if adjust:
             gamma2, beta2 = self.adjust2(x_adjust)
-            down2 = down2 + gamma2 * condition2 + beta2 + dose_emb2
+            down2 = down2 + gamma2 * condition2 + beta2
         else:
-            down2 = down2 + condition2 + dose_emb2
+            down2 = down2 + condition2
         
         # === FCB Forward ===
+        # down2 shape: (B, 128, 128, 128)
         spatial_feat = self.conv2_spatial(down2)  # -> (B, 256, 128, 128)
-        freq_feat = self.conv2_freq(down2)        # -> (B, 128, 128, 128)
-        merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)  # -> (B, 384, 128, 128)
+        freq_feat = self.conv2_freq(down2)        # -> (B, 64, 128, 128)
+        merged = torch.cat([spatial_feat, freq_feat], dim=1)  # -> (B, 320, 128, 128)
         conv2 = self.conv2_fusion(merged)         # -> (B, 256, 128, 128)
         # === End FCB Forward ===
 
         up1 = self.up1(conv2, conv1)
         condition3 = self.mlp3(time_emb)
-        b, c = condition3.shape  # c=128
+        b, c = condition3.shape
         condition3 = rearrange(condition3, 'b c -> b c 1 1')
-        
-        # 🔥 动态截取dose_emb以匹配condition3的通道数
-        dose_emb3 = dose_base[:, :c].unsqueeze(-1).unsqueeze(-1)  # [B, 128, 1, 1]
-        
         if adjust:
             gamma3, beta3 = self.adjust3(x_adjust)
-            up1 = up1 + gamma3 * condition3 + beta3 + dose_emb3
+            up1 = up1 + gamma3 * condition3 + beta3
         else:
-            up1 = up1 + condition3 + dose_emb3
+            up1 = up1 + condition3
         conv3 = self.conv3(up1)
 
         up2 = self.up2(conv3, inx)
         condition4 = self.mlp4(time_emb)
-        b, c = condition4.shape  # c=64
+        b, c = condition4.shape
         condition4 = rearrange(condition4, 'b c -> b c 1 1')
-        
-        # 🔥 动态截取dose_emb以匹配condition4的通道数
-        dose_emb4 = dose_base[:, :c].unsqueeze(-1).unsqueeze(-1)  # [B, 64, 1, 1]
-        
         if adjust:
             gamma4, beta4 = self.adjust4(x_adjust)
-            up2 = up2 + gamma4 * condition4 + beta4 + dose_emb4
+            up2 = up2 + gamma4 * condition4 + beta4
         else:
-            up2 = up2 + condition4 + dose_emb4
+            up2 = up2 + condition4
         conv4 = self.conv4(up2)
 
         # DRL output
@@ -313,14 +287,14 @@ class Network(nn.Module):
         self.norm_range_max = norm_range_max
         self.norm_range_min = norm_range_min
 
-    def forward(self, x, t, y, x_end, adjust=True, dose_value=None):
+    def forward(self, x, t, y, x_end, adjust=True):
         if self.context:
             x_middle = x[:, 1].unsqueeze(1)
         else:
             x_middle = x
         
         x_adjust = torch.cat((y, x_end), dim=1)
-        out, out_dist = self.unet(x, t, x_adjust, adjust, dose_value)
+        out, out_dist = self.unet(x, t, x_adjust, adjust=adjust)
         out = out + x_middle
 
         return out, out_dist

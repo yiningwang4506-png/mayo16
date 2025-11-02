@@ -1,4 +1,4 @@
-import os
+content = '''import os
 import os.path as osp
 from torch.nn import functional as F
 import torch
@@ -159,7 +159,8 @@ class corediff(TrainTask):
             dose_value=dose_value
         )
 
-        loss_mse = 0.5 * self.lossfn(gen_full_dose, full_dose) +                    0.5 * self.lossfn_sub1(gen_full_dose_sub1, full_dose)
+        loss_mse = 0.5 * self.lossfn(gen_full_dose, full_dose) + \
+                   0.5 * self.lossfn_sub1(gen_full_dose_sub1, full_dose)
 
         loss = loss_mse
 
@@ -289,3 +290,15 @@ class corediff(TrainTask):
         input_patches = torch.stack(input_patches).transpose(0, 1).reshape((-1, c_input, patch_size, patch_size))
         target_patches = torch.stack(target_patches).transpose(0, 1).reshape((-1, c_target, patch_size, patch_size))
         return input_patches, target_patches
+'''
+
+# 备份
+import shutil
+shutil.copy('models/corediff/corediff.py', 'models/corediff/corediff.py.backup4')
+
+# 写入修复后的内容
+with open('models/corediff/corediff.py', 'w', encoding='utf-8') as f:
+    f.write(content)
+
+print("✅ 完整修复完成！")
+print("✅ 备份保存在: models/corediff/corediff.py.backup4")

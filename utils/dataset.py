@@ -50,10 +50,14 @@ class CTDataset(Dataset):
 
         elif dataset == 'mayo_2020':
             data_root = './data_preprocess/gen_data/mayo_2020_npy'
-            if dose == 10:
-                patient_ids = ['C052', 'C232', 'C016', 'C120', 'C050']
-            elif dose == 25:
-                patient_ids = ['L077', 'L056', 'L186', 'L006', 'L148']
+            patient_ids = ['L014', 'L056', 'L057', 'L072', 'L081', 
+                           'L114', 'L131', 'L145', 'L160', 'L179']
+    
+            # 根据模式选择患者
+            if mode == 'train':
+                patient_ids = patient_ids[:9]  # 前9个用于训练
+            elif mode == 'test':
+                patient_ids = patient_ids[9:10] 
 
             patient_lists = []
             for ind, id in enumerate(patient_ids):
@@ -137,7 +141,7 @@ class CTDataset(Dataset):
         target = np.load(target)[np.newaxis,...].astype(np.float32) #(1, 512, 512)
         input = self.normalize_(input)
         target = self.normalize_(target)
-
+        
         return input, target
 
     def __len__(self):
@@ -152,10 +156,11 @@ class CTDataset(Dataset):
 
 
 dataset_dict = {
-    'train': partial(CTDataset, dataset='mayo_2016', mode='train', test_id=9, dose=25, context=True),
+    'train': partial(CTDataset, dataset='mayo_2016_sim', mode='train', test_id=9, dose=5, context=True),
     'mayo_2016_sim': partial(CTDataset, dataset='mayo_2016_sim', mode='test', test_id=9, dose=5, context=True),
     'mayo_2016': partial(CTDataset, dataset='mayo_2016', mode='test', test_id=9, dose=25, context=True),
-    'mayo_2020': partial(CTDataset, dataset='mayo_2020', mode='test', test_id=None, dose=None, context=True),
+    'mayo_2020_train': partial(CTDataset, dataset='mayo_2020', mode='train', dose=25, context=True),
+    'mayo_2020_test': partial(CTDataset, dataset='mayo_2020', mode='test', dose=25, context=True),
     'piglet': partial(CTDataset, dataset='piglet', mode='test', test_id=None, dose=None, context=True),
     'phantom': partial(CTDataset, dataset='phantom', mode='test', test_id=None, dose=108, context=True),
 }
