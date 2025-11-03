@@ -150,7 +150,7 @@ class corediff(TrainTask):
         low_dose, full_dose = inputs
         low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
         
-        dose_value = torch.full((low_dose.shape[0],), float(opt.dose), device=low_dose.device)
+        dose_value = torch.full((low_dose.shape[0],), opt.dose / 100.0, device=low_dose.device)
         
         gen_full_dose, x_mix, gen_full_dose_sub1, x_mix_sub1, out_dist_1, out_dist_2 = self.model(
             low_dose, full_dose, n_iter,
@@ -209,7 +209,7 @@ class corediff(TrainTask):
         psnr, ssim, rmse = 0., 0., 0.
         for low_dose, full_dose in tqdm.tqdm(self.test_loader, desc='test'):
             low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
-            dose_value = torch.full((low_dose.shape[0],), float(opt.dose), device=low_dose.device)
+            dose_value = torch.full((low_dose.shape[0],), opt.dose / 100.0, device=low_dose.device)
 
             gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
@@ -241,7 +241,7 @@ class corediff(TrainTask):
         self.ema_model.eval()
         low_dose, full_dose = self.test_images
 
-        dose_value = torch.full((low_dose.shape[0],), float(opt.dose), device=low_dose.device)
+        dose_value = torch.full((low_dose.shape[0],), opt.dose / 100.0, device=low_dose.device)
 
         gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
             batch_size = low_dose.shape[0],

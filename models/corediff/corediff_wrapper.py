@@ -93,6 +93,32 @@ class adjust_net(nn.Module):
         return out1, out2
 
 
+# 🔥 新增: FiLM调制模块
+class DoseFiLM(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.GELU(),
+            nn.Linear(64, channels * 2)
+        )
+        # 初始化为接近恒等映射
+        self.mlp[-1].weight.data.zero_()
+        self.mlp[-1].bias.data.zero_()
+    
+    def forward(self, dose_value):
+        """
+        Args:
+            dose_value: (B,) or (B, 1)
+        Returns:
+            gamma: (B, C, 1, 1)
+            beta: (B, C, 1, 1)
+        """
+        params = self.mlp(dose_value.view(-1, 1))  # (B, channels*2)
+        gamma, beta = params.chunk(2, dim=-1)       # 各 (B, channels)
+        return gamma.unsqueeze(-1).unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
+
+
 class UNet(nn.Module):
     def __init__(self, in_channels=2, out_channels=1,
                  reg_max=18,
@@ -101,13 +127,6 @@ class UNet(nn.Module):
                  norm_range_max=3072.0,
                  norm_range_min=-1024.0):
         super(UNet, self).__init__()
-
-        # 🔥 修改:使用更大的嵌入维度以适配所有层
-        self.dose_embed = nn.Sequential(
-            nn.Linear(1, 128),
-            nn.GELU(),
-            nn.Linear(128, 256)  # 输出256维,足够覆盖最大的condition维度
-        )
 
         # DRL parameters
         self.reg_max = reg_max
@@ -207,81 +226,79 @@ class UNet(nn.Module):
         
         self.hu_interval = (y_n - y_0) / self.reg_max
 
+        # 🔥 新增: FiLM模块(只在down2和up1使用)
+        self.dose_film_down2 = DoseFiLM(128)
+        self.dose_film_up1 = DoseFiLM(128)
+
     def forward(self, x, t, x_adjust, adjust, dose_value): 
         inx = self.inc(x)
         time_emb = self.time_mlp(t)
         
-        # 🔥 生成基础剂量嵌入 [B, 256]
-        dose_base = self.dose_embed(dose_value.view(-1, 1))
-        dose_base = dose_base * 2.0
+        # === down1: 只使用时间条件(保持原有逻辑) ===
         down1 = self.down1(inx)
         condition1 = self.mlp1(time_emb)
-
-        b, c = condition1.shape  # c=64
         condition1 = rearrange(condition1, 'b c -> b c 1 1')
-        
-        # 🔥 动态截取dose_emb以匹配condition1的通道数
-        dose_emb1 = dose_base[:, :c].unsqueeze(-1).unsqueeze(-1)  # [B, 64, 1, 1]
         
         if adjust:
             gamma1, beta1 = self.adjust1(x_adjust)
-            down1 = down1 + gamma1 * condition1 + beta1 + dose_emb1
+            down1 = down1 + gamma1 * condition1 + beta1
         else:
-            down1 = down1 + condition1 + dose_emb1
+            down1 = down1 + condition1
         conv1 = self.conv1(down1)
 
+        # === down2: FiLM调制剂量 + 时间条件 ===
         down2 = self.down2(conv1)
         condition2 = self.mlp2(time_emb)
-        b, c = condition2.shape  # c=128
         condition2 = rearrange(condition2, 'b c -> b c 1 1')
         
-        # 🔥 动态截取dose_emb以匹配condition2的通道数
-        dose_emb2 = dose_base[:, :c].unsqueeze(-1).unsqueeze(-1)  # [B, 128, 1, 1]
+        # 🔥 应用FiLM调制
+        gamma_dose, beta_dose = self.dose_film_down2(dose_value)
         
         if adjust:
             gamma2, beta2 = self.adjust2(x_adjust)
-            down2 = down2 + gamma2 * condition2 + beta2 + dose_emb2
+            # FiLM调制 + adjust调制 + 时间条件
+            down2 = down2 * (1 + gamma_dose) + beta_dose + gamma2 * condition2 + beta2
         else:
-            down2 = down2 + condition2 + dose_emb2
+            # FiLM调制 + 时间条件
+            down2 = down2 * (1 + gamma_dose) + beta_dose + condition2
         
-        # === FCB Forward ===
+        # === FCB Forward (保持不变) ===
         spatial_feat = self.conv2_spatial(down2)  # -> (B, 256, 128, 128)
         freq_feat = self.conv2_freq(down2)        # -> (B, 128, 128, 128)
-        merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)  # -> (B, 384, 128, 128)
+        merged = torch.cat([spatial_feat, 0.5 * freq_feat], dim=1)  # -> (B, 384, 128, 128)
         conv2 = self.conv2_fusion(merged)         # -> (B, 256, 128, 128)
         # === End FCB Forward ===
 
+        # === up1: FiLM调制剂量 + 时间条件 ===
         up1 = self.up1(conv2, conv1)
         condition3 = self.mlp3(time_emb)
-        b, c = condition3.shape  # c=128
         condition3 = rearrange(condition3, 'b c -> b c 1 1')
         
-        # 🔥 动态截取dose_emb以匹配condition3的通道数
-        dose_emb3 = dose_base[:, :c].unsqueeze(-1).unsqueeze(-1)  # [B, 128, 1, 1]
+        # 🔥 应用FiLM调制
+        gamma_dose3, beta_dose3 = self.dose_film_up1(dose_value)
         
         if adjust:
             gamma3, beta3 = self.adjust3(x_adjust)
-            up1 = up1 + gamma3 * condition3 + beta3 + dose_emb3
+            # FiLM调制 + adjust调制 + 时间条件
+            up1 = up1 * (1 + gamma_dose3) + beta_dose3 + gamma3 * condition3 + beta3
         else:
-            up1 = up1 + condition3 + dose_emb3
+            # FiLM调制 + 时间条件
+            up1 = up1 * (1 + gamma_dose3) + beta_dose3 + condition3
         conv3 = self.conv3(up1)
 
+        # === up2: 只使用时间条件(保持原有逻辑) ===
         up2 = self.up2(conv3, inx)
         condition4 = self.mlp4(time_emb)
-        b, c = condition4.shape  # c=64
         condition4 = rearrange(condition4, 'b c -> b c 1 1')
-        
-        # 🔥 动态截取dose_emb以匹配condition4的通道数
-        dose_emb4 = dose_base[:, :c].unsqueeze(-1).unsqueeze(-1)  # [B, 64, 1, 1]
         
         if adjust:
             gamma4, beta4 = self.adjust4(x_adjust)
-            up2 = up2 + gamma4 * condition4 + beta4 + dose_emb4
+            up2 = up2 + gamma4 * condition4 + beta4
         else:
-            up2 = up2 + condition4 + dose_emb4
+            up2 = up2 + condition4
         conv4 = self.conv4(up2)
 
-        # DRL output
+        # DRL output (保持不变)
         out = self.outc(conv4)
         out_dist = out.permute(0, 2, 3, 1)
         out = out_dist.softmax(3).matmul(self.proj.view([-1, 1]))
