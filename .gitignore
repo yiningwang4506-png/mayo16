@@ -21,3 +21,24 @@ __pycache__/
 .idea/
 .env
 venv/
+# 忽略大文件和中间结果
+data/
+output/
+checkpoints/
+pretrained_models/
+data_preprocess/
+
+# Python 缓存和笔记本缓存
+__pycache__/
+.ipynb_checkpoints/
+
+# 大模型 / 中间结果文件
+*.pt
+*.pth
+*.npz
+*.npy
+*.hdf5
+*.ckpt
+*.zip
+*.tar
+*.tar.gz

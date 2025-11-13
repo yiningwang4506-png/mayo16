@@ -70,8 +70,8 @@ class TrainTask(object):
         parser.add_argument('--context', action="store_true",
                             help='use contextual information')   #
         parser.add_argument('--image_size', type=int, default=512)
-        parser.add_argument('--dose', type=int, default=5,
-                            help='dose% data use for training and testing')
+        parser.add_argument('--dose', type=str, default='25',
+                            help='dose%% data use for training and testing (comma-separated for mixed training, e.g., "25,50")')
 
         return parser
 
@@ -86,11 +86,21 @@ class TrainTask(object):
     def set_loader(self):
         opt = self.opt
 
+        # 解析 dose 参数(统一处理)
+        if isinstance(opt.dose, str):
+            dose_list = [int(d.strip()) for d in opt.dose.split(',')]
+        elif isinstance(opt.dose, (list, tuple)):
+            dose_list = opt.dose
+        else:
+            dose_list = [opt.dose]
+        
+        print(f"✅ Using dose levels: {dose_list}")
+
         if opt.mode == 'train':
             train_dataset = dataset_dict['train'](
                 dataset=opt.train_dataset,
                 test_id=opt.test_id,
-                dose=opt.dose,
+                dose=dose_list,
                 context=opt.context,
             )
             train_sampler = RandomSampler(dataset=train_dataset, batch_size=opt.batch_size,
@@ -111,7 +121,7 @@ class TrainTask(object):
         test_dataset = dataset_dict[opt.test_dataset](
             dataset=opt.test_dataset,
             test_id=opt.test_id,
-            dose=opt.dose,
+            dose=dose_list,
             context=opt.context
         )
         test_loader = torch.utils.data.DataLoader(
