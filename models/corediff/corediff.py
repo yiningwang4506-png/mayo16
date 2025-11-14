@@ -15,6 +15,11 @@ from models.basic_template import TrainTask
 from .corediff_wrapper import Network, WeightNet
 from .diffusion_modules import Diffusion
 
+# 🔥 新增导入
+import sys
+sys.path.append('/root/autodl-tmp/CoreDiff-main')
+from medical_text_encoder import MedicalTextEncoder
+
 import wandb
 
 
@@ -91,6 +96,19 @@ class corediff(TrainTask):
 
         self.lossfn = nn.MSELoss()
         self.lossfn_sub1 = nn.MSELoss()
+        
+        # 🔥 添加文本编码器（如果启用）
+        self.use_text = getattr(opt, 'use_text_condition', False)
+        if self.use_text:
+            self.text_encoder = MedicalTextEncoder(
+                output_dim=256,
+                freeze_bert=True,
+                cache_dir='/root/autodl-tmp/CoreDiff-main/pretrained_models'
+            ).cuda()
+            print("✅ Text encoder initialized")
+        else:
+            self.text_encoder = None
+            print("✅ Standard training mode (no text condition)")
         
         # DRL parameters for DFL loss
         self.use_dfl_loss = opt.use_dfl_loss
@@ -176,15 +194,33 @@ class corediff(TrainTask):
         opt = self.opt
         self.model.train()
         self.ema_model.train()
-        low_dose, full_dose = inputs
-        low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
+        
+        # 🔥 兼容新旧数据格式
+        if isinstance(inputs, dict):
+            # 新格式（文本条件）
+            low_dose = inputs['input'].cuda()
+            full_dose = inputs['target'].cuda()
+            text_descriptions = inputs.get('text_description', None)
+            
+            # 编码文本
+            if self.use_text and text_descriptions is not None:
+                with torch.no_grad():  # 冻结BERT，不需要梯度
+                    text_emb = self.text_encoder(text_descriptions)  # [B, 256]
+            else:
+                text_emb = None
+        else:
+            # 旧格式（向后兼容）
+            low_dose, full_dose = inputs
+            low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
+            text_emb = None
 
         ## Training process of CoreDiff with DRL
         # Returns: gen_full_dose, x_mix, gen_full_dose_sub1, x_mix_sub1, out_dist_1, out_dist_2
         gen_full_dose, x_mix, gen_full_dose_sub1, x_mix_sub1, out_dist_1, out_dist_2 = self.model(
             low_dose, full_dose, n_iter,
             only_adjust_two_step=opt.only_adjust_two_step,
-            start_adjust_iter=opt.start_adjust_iter
+            start_adjust_iter=opt.start_adjust_iter,
+            text_emb=text_emb  # 🔥 传入文本条件
         )
 
         # MSE loss
@@ -222,6 +258,8 @@ class corediff(TrainTask):
                 print(f"loss_mse value: {loss_mse.item():.8f}")
                 print(f"loss_dfl value: {loss_dfl.item():.8f}")
                 print(f"total loss value: {loss.item():.8f}")
+                if self.use_text and text_emb is not None:
+                    print(f"text_emb shape: {text_emb.shape}")
                 print(f"{'='*60}\n")
 
         loss.backward()
@@ -257,8 +295,22 @@ class corediff(TrainTask):
         self.ema_model.eval()
 
         psnr, ssim, rmse = 0., 0., 0.
-        for low_dose, full_dose in tqdm.tqdm(self.test_loader, desc='test'):
-            low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
+        for inputs in tqdm.tqdm(self.test_loader, desc='test'):
+            # 🔥 兼容新旧格式
+            if isinstance(inputs, dict):
+                low_dose = inputs['input'].cuda()
+                full_dose = inputs['target'].cuda()
+                text_descriptions = inputs.get('text_description', None)
+                
+                if self.use_text and text_descriptions is not None:
+                    with torch.no_grad():
+                        text_emb = self.text_encoder(text_descriptions)
+                else:
+                    text_emb = None
+            else:
+                low_dose, full_dose = inputs
+                low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
+                text_emb = None
 
             gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
@@ -267,6 +319,7 @@ class corediff(TrainTask):
                 sampling_routine = self.sampling_routine,
                 n_iter=n_iter,
                 start_adjust_iter=opt.start_adjust_iter,
+                text_emb=text_emb  # 🔥 传入文本条件
             )
 
             full_dose = self.transfer_calculate_window(full_dose)
@@ -290,6 +343,16 @@ class corediff(TrainTask):
         self.ema_model.eval()
         low_dose, full_dose = self.test_images
 
+        # 🔥 为可视化生成文本条件（如果启用）
+        if self.use_text:
+            # 假设test_images是单剂量的，使用默认剂量
+            dose_value = opt.dose if isinstance(opt.dose, int) else int(opt.dose.split(',')[0])
+            text_desc = [f"This is a low-dose CT scan with {dose_value}% radiation dose."] * low_dose.shape[0]
+            with torch.no_grad():
+                text_emb = self.text_encoder(text_desc)
+        else:
+            text_emb = None
+
         gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
                 img = low_dose,
@@ -297,6 +360,7 @@ class corediff(TrainTask):
                 sampling_routine = self.sampling_routine,
                 n_iter=n_iter,
                 start_adjust_iter=opt.start_adjust_iter,
+                text_emb=text_emb  # 🔥 传入文本条件
             )
 
         if self.context:
@@ -323,18 +387,30 @@ class corediff(TrainTask):
         for i in range(len(self.test_dataset)-2):
             if i == opt.index:
                 if opt.unpair:
-                    low_dose, _ = self.test_dataset[i]
-                    _, full_dose = self.test_dataset[i+2]
+                    inputs_low = self.test_dataset[i]
+                    inputs_full = self.test_dataset[i+2]
                 else:
-                    low_dose, full_dose = self.test_dataset[i]
+                    inputs_low = self.test_dataset[i]
+                    inputs_full = inputs_low
+                
+                # 🔥 兼容新旧格式
+                if isinstance(inputs_low, dict):
+                    low_dose = inputs_low['input']
+                    full_dose = inputs_full['target']
+                else:
+                    low_dose, _ = inputs_low
+                    _, full_dose = inputs_full
+                    
         low_dose, full_dose = torch.from_numpy(low_dose).unsqueeze(0).cuda(), torch.from_numpy(full_dose).unsqueeze(0).cuda()
 
+        # OSL framework不需要文本条件
         gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
             batch_size=low_dose.shape[0],
             img=low_dose,
             t=self.T,
             sampling_routine=self.sampling_routine,
             start_adjust_iter=opt.start_adjust_iter,
+            text_emb=None
         )
 
         inputs = imstep_imgs.transpose(0, 2).squeeze(0)
@@ -401,8 +477,14 @@ class corediff(TrainTask):
         psnr_ori, ssim_ori, rmse_ori = 0., 0., 0.
         psnr_opt, ssim_opt, rmse_opt = 0., 0., 0.
 
-        for low_dose, full_dose in tqdm.tqdm(self.test_loader, desc='test'):
-            low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
+        for inputs in tqdm.tqdm(self.test_loader, desc='test'):
+            # 🔥 兼容新旧格式
+            if isinstance(inputs, dict):
+                low_dose = inputs['input'].cuda()
+                full_dose = inputs['target'].cuda()
+            else:
+                low_dose, full_dose = inputs
+                low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
 
             gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size=low_dose.shape[0],
@@ -411,6 +493,7 @@ class corediff(TrainTask):
                 sampling_routine=self.sampling_routine,
                 n_iter=test_iter,
                 start_adjust_iter=opt.start_adjust_iter,
+                text_emb=None  # OSL不需要文本条件
             )
             imstep_imgs = imstep_imgs[:self.T]
             inputs = imstep_imgs.squeeze(2).transpose(0, 1)

@@ -166,6 +166,9 @@ class UNet(nn.Module):
             single_conv(256, 256)
         )
         # === End FCB Integration ===
+        
+        # 🔥 Text projection layer (initialized lazily)
+        self.text_proj = None
 
         self.up1 = up(256)
         self.mlp3 = nn.Sequential(
@@ -200,7 +203,7 @@ class UNet(nn.Module):
         
         self.hu_interval = (y_n - y_0) / self.reg_max
 
-    def forward(self, x, t, x_adjust, adjust):
+    def forward(self, x, t, x_adjust, adjust, text_emb=None):
         inx = self.inc(x)
         time_emb = self.time_mlp(t)
         
@@ -233,6 +236,17 @@ class UNet(nn.Module):
         merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)  # -> (B, 384, 128, 128)
         conv2 = self.conv2_fusion(merged)         # -> (B, 256, 128, 128)
         # === End FCB Forward ===
+        
+        # 🔥 如果有文本条件，进行融合
+        if text_emb is not None:
+            B, C, H, W = conv2.shape
+            # 将text_emb [B, 256] reshape成 [B, 256, 1, 1] 并广播
+            text_cond = text_emb.view(B, -1, 1, 1).expand(B, -1, H, W)
+            # 使用1x1卷积将256维投影到conv2的通道数
+            if self.text_proj is None:
+                self.text_proj = nn.Conv2d(256, C, 1).to(conv2.device)
+            text_feat = self.text_proj(text_cond)
+            conv2 = conv2 + 0.1 * text_feat  # 加权融合
 
         up1 = self.up1(conv2, conv1)
         condition3 = self.mlp3(time_emb)
@@ -288,14 +302,14 @@ class Network(nn.Module):
         self.norm_range_max = norm_range_max
         self.norm_range_min = norm_range_min
 
-    def forward(self, x, t, y, x_end, adjust=True):
+    def forward(self, x, t, y, x_end, adjust=True, text_emb=None):
         if self.context:
             x_middle = x[:, 1].unsqueeze(1)
         else:
             x_middle = x
         
         x_adjust = torch.cat((y, x_end), dim=1)
-        out, out_dist = self.unet(x, t, x_adjust, adjust=adjust)
+        out, out_dist = self.unet(x, t, x_adjust, adjust=adjust, text_emb=text_emb)
         out = out + x_middle
 
         return out, out_dist

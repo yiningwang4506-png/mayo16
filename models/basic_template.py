@@ -73,6 +73,10 @@ class TrainTask(object):
         parser.add_argument('--dose', type=str, default='25',
                             help='dose%% data use for training and testing (comma-separated for mixed training, e.g., "25,50")')
 
+        # 🔥 新增：文本条件参数
+        parser.add_argument('--use_text_condition', action='store_true',
+                            help='use text condition for multi-dose/multi-site generalization')
+
         return parser
 
     @staticmethod
@@ -96,9 +100,22 @@ class TrainTask(object):
         
         print(f"✅ Using dose levels: {dose_list}")
 
+        # 🔥 根据是否启用文本条件选择数据集
+        if opt.use_text_condition:
+            import sys
+            sys.path.append('/root/autodl-tmp/CoreDiff-main')
+            from text_conditioned_dataset import TextConditionedCTDataset
+            DatasetClass = TextConditionedCTDataset
+            print("✅ Using text-conditioned dataset")
+        else:
+            from utils.dataset import CTDataset
+            DatasetClass = CTDataset
+            print("✅ Using standard dataset")
+
         if opt.mode == 'train':
-            train_dataset = dataset_dict['train'](
+            train_dataset = DatasetClass(
                 dataset=opt.train_dataset,
+                mode='train',
                 test_id=opt.test_id,
                 dose=dose_list,
                 context=opt.context,
@@ -118,8 +135,9 @@ class TrainTask(object):
             )
             self.train_loader = train_loader
 
-        test_dataset = dataset_dict[opt.test_dataset](
+        test_dataset = DatasetClass(
             dataset=opt.test_dataset,
+            mode='test',
             test_id=opt.test_id,
             dose=dose_list,
             context=opt.context
@@ -133,11 +151,19 @@ class TrainTask(object):
         )
         self.test_loader = test_loader
 
-        test_images = [test_dataset[i] for i in range(0, min(300, len(test_dataset)), 75)]
-        low_dose = torch.stack([torch.from_numpy(x[0]) for x in test_images], dim=0).cuda()
-        full_dose = torch.stack([torch.from_numpy(x[1]) for x in test_images], dim=0).cuda()
+        # 🔥 处理 test_images（用于可视化）
+        test_samples = [test_dataset[i] for i in range(0, min(300, len(test_dataset)), 75)]
+        
+        if opt.use_text_condition:
+            # 新格式：dict
+            low_dose = torch.stack([torch.from_numpy(x['input']) for x in test_samples], dim=0).cuda()
+            full_dose = torch.stack([torch.from_numpy(x['target']) for x in test_samples], dim=0).cuda()
+        else:
+            # 旧格式：tuple
+            low_dose = torch.stack([torch.from_numpy(x[0]) for x in test_samples], dim=0).cuda()
+            full_dose = torch.stack([torch.from_numpy(x[1]) for x in test_samples], dim=0).cuda()
+        
         self.test_images = (low_dose, full_dose)
-
         self.test_dataset = test_dataset
 
 
