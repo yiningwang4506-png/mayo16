@@ -93,13 +93,55 @@ class adjust_net(nn.Module):
         return out1, out2
 
 
+class FiLMLayer(nn.Module):
+    """
+    Feature-wise Linear Modulation (FiLM) Layer
+    用文本条件调制图像特征
+    """
+    def __init__(self, text_dim, feature_dim):
+        super(FiLMLayer, self).__init__()
+        self.film_gen = nn.Sequential(
+            nn.Linear(text_dim, feature_dim * 2),
+            nn.GELU()
+        )
+        self.feature_dim = feature_dim
+    
+    def forward(self, feature, text_emb):
+        """
+        Args:
+            feature: [B, C, H, W]
+            text_emb: [B, text_dim]
+        Returns:
+            modulated_feature: [B, C, H, W]
+        """
+        if text_emb is None:
+            return feature
+        
+        B, C, H, W = feature.shape
+        
+        # 生成 gamma 和 beta
+        params = self.film_gen(text_emb)  # [B, C*2]
+        gamma, beta = params.chunk(2, dim=1)  # 各 [B, C]
+        
+        # Reshape 为 [B, C, 1, 1] 以便广播
+        gamma = gamma.view(B, C, 1, 1)
+        beta = beta.view(B, C, 1, 1)
+        
+        # FiLM: gamma * x + beta
+        # 使用残差连接：0.5 * film + 0.5 * original
+        film_feature = gamma * feature + beta
+        return 0.5 * film_feature + 0.5 * feature
+
+
 class UNet(nn.Module):
     def __init__(self, in_channels=2, out_channels=1,
                  reg_max=18,
                  y_0=-160.0,
                  y_n=200.0,
                  norm_range_max=3072.0,
-                 norm_range_min=-1024.0):
+                 norm_range_min=-1024.0,
+                 text_dim=256,
+                 use_text=False):
         super(UNet, self).__init__()
 
         # DRL parameters
@@ -108,6 +150,9 @@ class UNet(nn.Module):
         self.y_n = y_n
         self.norm_range_max = norm_range_max
         self.norm_range_min = norm_range_min
+        
+        # 🔥 Text condition flag
+        self.use_text = use_text
 
         dim = 32
         self.time_mlp = nn.Sequential(
@@ -167,8 +212,13 @@ class UNet(nn.Module):
         )
         # === End FCB Integration ===
         
-        # 🔥 Text projection layer (initialized lazily)
-        self.text_proj = None
+        # 🔥 FiLM layers for multi-level text fusion
+        if self.use_text:
+            self.film_conv1 = FiLMLayer(text_dim, 128)
+            self.film_conv2 = FiLMLayer(text_dim, 256)  # Bottleneck (most important)
+            self.film_conv3 = FiLMLayer(text_dim, 128)
+            self.film_conv4 = FiLMLayer(text_dim, 64)
+            print("✅ FiLM layers initialized for 4-level text fusion")
 
         self.up1 = up(256)
         self.mlp3 = nn.Sequential(
@@ -207,6 +257,7 @@ class UNet(nn.Module):
         inx = self.inc(x)
         time_emb = self.time_mlp(t)
         
+        # ========== Encoder Stage 1 ==========
         down1 = self.down1(inx)
         condition1 = self.mlp1(time_emb)
         b, c = condition1.shape
@@ -217,7 +268,12 @@ class UNet(nn.Module):
         else:
             down1 = down1 + condition1
         conv1 = self.conv1(down1)
+        
+        # 🔥 FiLM fusion - Stage 1 (weight 0.3)
+        if self.use_text:
+            conv1 = self.film_conv1(conv1, text_emb)
 
+        # ========== Encoder Stage 2 ==========
         down2 = self.down2(conv1)
         condition2 = self.mlp2(time_emb)
         b, c = condition2.shape
@@ -229,25 +285,16 @@ class UNet(nn.Module):
             down2 = down2 + condition2
         
         # === FCB Forward ===
-        # down2 shape: (B, 128, 128, 128)
         spatial_feat = self.conv2_spatial(down2)  # -> (B, 256, 128, 128)
         freq_feat = self.conv2_freq(down2)        # -> (B, 128, 128, 128)
-        # 可调权重版本
         merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)  # -> (B, 384, 128, 128)
         conv2 = self.conv2_fusion(merged)         # -> (B, 256, 128, 128)
-        # === End FCB Forward ===
         
-        # 🔥 如果有文本条件，进行融合
-        if text_emb is not None:
-            B, C, H, W = conv2.shape
-            # 将text_emb [B, 256] reshape成 [B, 256, 1, 1] 并广播
-            text_cond = text_emb.view(B, -1, 1, 1).expand(B, -1, H, W)
-            # 使用1x1卷积将256维投影到conv2的通道数
-            if self.text_proj is None:
-                self.text_proj = nn.Conv2d(256, C, 1).to(conv2.device)
-            text_feat = self.text_proj(text_cond)
-            conv2 = conv2 + 0.1 * text_feat  # 加权融合
+        # 🔥 FiLM fusion - Bottleneck (weight 0.5, most important)
+        if self.use_text:
+            conv2 = self.film_conv2(conv2, text_emb)
 
+        # ========== Decoder Stage 1 ==========
         up1 = self.up1(conv2, conv1)
         condition3 = self.mlp3(time_emb)
         b, c = condition3.shape
@@ -258,7 +305,12 @@ class UNet(nn.Module):
         else:
             up1 = up1 + condition3
         conv3 = self.conv3(up1)
+        
+        # 🔥 FiLM fusion - Stage 3 (weight 0.3)
+        if self.use_text:
+            conv3 = self.film_conv3(conv3, text_emb)
 
+        # ========== Decoder Stage 2 ==========
         up2 = self.up2(conv3, inx)
         condition4 = self.mlp4(time_emb)
         b, c = condition4.shape
@@ -269,6 +321,10 @@ class UNet(nn.Module):
         else:
             up2 = up2 + condition4
         conv4 = self.conv4(up2)
+        
+        # 🔥 FiLM fusion - Stage 4 (weight 0.1)
+        if self.use_text:
+            conv4 = self.film_conv4(conv4, text_emb)
 
         # DRL output
         out = self.outc(conv4)
@@ -285,7 +341,9 @@ class Network(nn.Module):
                  y_0=-160.0,
                  y_n=200.0,
                  norm_range_max=3072.0,
-                 norm_range_min=-1024.0):
+                 norm_range_min=-1024.0,
+                 text_dim=256,
+                 use_text=False):
         super(Network, self).__init__()
         self.unet = UNet(in_channels=in_channels, 
                         out_channels=out_channels,
@@ -293,7 +351,9 @@ class Network(nn.Module):
                         y_0=y_0,
                         y_n=y_n,
                         norm_range_max=norm_range_max,
-                        norm_range_min=norm_range_min)
+                        norm_range_min=norm_range_min,
+                        text_dim=text_dim,
+                        use_text=use_text)
         self.context = context
         
         self.reg_max = reg_max

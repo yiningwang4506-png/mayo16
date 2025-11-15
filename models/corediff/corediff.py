@@ -69,6 +69,10 @@ class corediff(TrainTask):
         self.sampling_routine = opt.sampling_routine
         self.context = opt.context
         
+        # 🔥 检查是否使用文本条件
+        self.use_text = getattr(opt, 'use_text_condition', False)
+        
+        # 🔥 创建 denoise_fn，传入 use_text 参数
         denoise_fn = Network(
             in_channels=opt.in_channels, 
             context=opt.context,
@@ -76,7 +80,9 @@ class corediff(TrainTask):
             y_0=opt.y_0,
             y_n=opt.y_n,
             norm_range_max=opt.norm_range_max,
-            norm_range_min=opt.norm_range_min
+            norm_range_min=opt.norm_range_min,
+            text_dim=256,           # 🔥 新增
+            use_text=self.use_text  # 🔥 新增
         )
 
         model = Diffusion(
@@ -98,14 +104,15 @@ class corediff(TrainTask):
         self.lossfn_sub1 = nn.MSELoss()
         
         # 🔥 添加文本编码器（如果启用）
-        self.use_text = getattr(opt, 'use_text_condition', False)
         if self.use_text:
             self.text_encoder = MedicalTextEncoder(
                 output_dim=256,
                 freeze_bert=True,
-                cache_dir='/root/autodl-tmp/CoreDiff-main/pretrained_models'
+                cache_dir='/root/autodl-tmp/CoreDiff-main/pretrained_models',
+                local_files_only=True
             ).cuda()
-            print("✅ Text encoder initialized")
+            print("✅ Text encoder initialized (BERT frozen)")
+            print("✅ FiLM-based text conditioning enabled")
         else:
             self.text_encoder = None
             print("✅ Standard training mode (no text condition)")
@@ -244,22 +251,17 @@ class corediff(TrainTask):
             
             loss = loss_mse + self.dfl_weight * loss_dfl
             
-            # 添加这些检查（在backward之前）
-            if n_iter % 100 == 1:  # 每100步打印一次
+            # 🔥 调试信息（每100步打印一次）
+            if n_iter % 100 == 1:
                 print(f"\n{'='*60}")
-                print(f"[梯度检查 - Iter {n_iter}]")
+                print(f"[Training - Iter {n_iter}]")
                 print(f"{'='*60}")
-                print(f"out_dist_1.requires_grad: {out_dist_1.requires_grad}")
-                print(f"out_dist_2.requires_grad: {out_dist_2.requires_grad}")
-                print(f"loss_dfl_1.requires_grad: {loss_dfl_1.requires_grad}")
-                print(f"loss_dfl_2.requires_grad: {loss_dfl_2.requires_grad}")
-                print(f"loss_dfl.requires_grad: {loss_dfl.requires_grad}")
-                print(f"loss.requires_grad: {loss.requires_grad}")
-                print(f"loss_mse value: {loss_mse.item():.8f}")
-                print(f"loss_dfl value: {loss_dfl.item():.8f}")
-                print(f"total loss value: {loss.item():.8f}")
+                print(f"loss_mse: {loss_mse.item():.6f}")
+                print(f"loss_dfl: {loss_dfl.item():.6f}")
+                print(f"total loss: {loss.item():.6f}")
                 if self.use_text and text_emb is not None:
                     print(f"text_emb shape: {text_emb.shape}")
+                    print(f"text_emb norm: {text_emb.norm(dim=1).mean().item():.4f}")
                 print(f"{'='*60}\n")
 
         loss.backward()
