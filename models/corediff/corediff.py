@@ -76,7 +76,8 @@ class corediff(TrainTask):
             y_0=opt.y_0,
             y_n=opt.y_n,
             norm_range_max=opt.norm_range_max,
-            norm_range_min=opt.norm_range_min
+            norm_range_min=opt.norm_range_min,
+            text_emb_dim=256
         )
 
         model = Diffusion(
@@ -200,7 +201,7 @@ class corediff(TrainTask):
             # 新格式（文本条件）
             low_dose = inputs['input'].cuda()
             full_dose = inputs['target'].cuda()
-            text_descriptions = inputs.get('text_description', None)
+            text_descriptions = inputs.get('description', None)
             
             # 编码文本
             if self.use_text and text_descriptions is not None:

@@ -99,7 +99,8 @@ class UNet(nn.Module):
                  y_0=-160.0,
                  y_n=200.0,
                  norm_range_max=3072.0,
-                 norm_range_min=-1024.0):
+                 norm_range_min=-1024.0,
+                 text_emb_dim=256):  # 🔥 添加参数
         super(UNet, self).__init__()
 
         # DRL parameters
@@ -167,8 +168,8 @@ class UNet(nn.Module):
         )
         # === End FCB Integration ===
         
-        # 🔥 Text projection layer (initialized lazily)
-        self.text_proj = None
+        # 🔥 直接初始化 text_proj (替换原来的 self.text_proj = None)
+        self.text_proj = nn.Conv2d(text_emb_dim, 256, 1)
 
         self.up1 = up(256)
         self.mlp3 = nn.Sequential(
@@ -237,14 +238,12 @@ class UNet(nn.Module):
         conv2 = self.conv2_fusion(merged)         # -> (B, 256, 128, 128)
         # === End FCB Forward ===
         
-        # 🔥 如果有文本条件，进行融合
+        # 🔥 如果有文本条件,进行融合
         if text_emb is not None:
             B, C, H, W = conv2.shape
             # 将text_emb [B, 256] reshape成 [B, 256, 1, 1] 并广播
             text_cond = text_emb.view(B, -1, 1, 1).expand(B, -1, H, W)
-            # 使用1x1卷积将256维投影到conv2的通道数
-            if self.text_proj is None:
-                self.text_proj = nn.Conv2d(256, C, 1).to(conv2.device)
+            # 使用1x1卷积投影
             text_feat = self.text_proj(text_cond)
             conv2 = conv2 + 0.1 * text_feat  # 加权融合
 
@@ -285,7 +284,8 @@ class Network(nn.Module):
                  y_0=-160.0,
                  y_n=200.0,
                  norm_range_max=3072.0,
-                 norm_range_min=-1024.0):
+                 norm_range_min=-1024.0,
+                 text_emb_dim=256):  # 🔥 添加参数
         super(Network, self).__init__()
         self.unet = UNet(in_channels=in_channels, 
                         out_channels=out_channels,
@@ -293,7 +293,8 @@ class Network(nn.Module):
                         y_0=y_0,
                         y_n=y_n,
                         norm_range_max=norm_range_max,
-                        norm_range_min=norm_range_min)
+                        norm_range_min=norm_range_min,
+                        text_emb_dim=text_emb_dim)  # 🔥 传入参数
         self.context = context
         
         self.reg_max = reg_max
