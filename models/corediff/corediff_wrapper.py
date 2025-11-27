@@ -9,6 +9,42 @@ sys.path.append('.')
 from FCB import FCB
 
 
+# 🔥 [新增 & 优化] FiLM 层定义 (带零初始化)
+class FiLMLayer(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(FiLMLayer, self).__init__()
+        # input_dim: 文本维度 (256)
+        # output_dim: 特征图通道数 (256)
+        self.layer = nn.Linear(input_dim, output_dim * 2)
+
+        # 🔥🔥🔥 关键修改：零初始化 🔥🔥🔥
+        # 这保证了训练初始阶段 gamma=0, beta=0
+        # 使得 output = (1+0)*x + 0 = x
+        # 这样起步就是 Baseline 水平，只会变好，不会变差！
+        nn.init.zeros_(self.layer.weight)
+        nn.init.zeros_(self.layer.bias)
+
+    def forward(self, x, text_emb):
+        """
+        x: [B, C, H, W] - 图像特征
+        text_emb: [B, input_dim] - 文本向量
+        """
+        if text_emb is None:
+            return x
+            
+        # 1. 计算调制参数 [B, C*2]
+        params = self.layer(text_emb)
+        
+        # 2. Reshape 并分割为 gamma 和 beta
+        # params: [B, 2*C] -> [B, 2*C, 1, 1]
+        params = params.unsqueeze(2).unsqueeze(3)
+        # gamma, beta: 各自 [B, C, 1, 1]
+        gamma, beta = params.chunk(2, dim=1)
+        
+        # 3. FiLM 调制公式: (1 + gamma) * x + beta
+        return (1 + gamma) * x + beta
+
+
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -100,7 +136,7 @@ class UNet(nn.Module):
                  y_n=200.0,
                  norm_range_max=3072.0,
                  norm_range_min=-1024.0,
-                 text_emb_dim=256):  # 🔥 添加参数
+                 text_emb_dim=256):
         super(UNet, self).__init__()
 
         # DRL parameters
@@ -143,14 +179,12 @@ class UNet(nn.Module):
         self.adjust2 = adjust_net(128)
         
         # === FCB Integration ===
-        # Spatial branch (3 layers)
         self.conv2_spatial = nn.Sequential(
             single_conv(128, 256),
             single_conv(256, 256),
             single_conv(256, 256)
         )
         
-        # Frequency branch (FCB)
         self.conv2_freq = FCB(
             input_chs=128,
             output_chs=128,
@@ -160,16 +194,15 @@ class UNet(nn.Module):
             init='he'
         )
         
-        # Fusion (3 layers)
         self.conv2_fusion = nn.Sequential(
-            single_conv(384, 256),  # 256(spatial) + 128(freq) = 384
+            single_conv(384, 256),
             single_conv(256, 256),
             single_conv(256, 256)
         )
         # === End FCB Integration ===
         
-        # 🔥 直接初始化 text_proj (替换原来的 self.text_proj = None)
-        self.text_proj = nn.Conv2d(text_emb_dim, 256, 1)
+        # 🔥 [FiLM层初始化]
+        self.film_bottleneck = FiLMLayer(text_emb_dim, 256)
 
         self.up1 = up(256)
         self.mlp3 = nn.Sequential(
@@ -230,22 +263,15 @@ class UNet(nn.Module):
             down2 = down2 + condition2
         
         # === FCB Forward ===
-        # down2 shape: (B, 128, 128, 128)
-        spatial_feat = self.conv2_spatial(down2)  # -> (B, 256, 128, 128)
-        freq_feat = self.conv2_freq(down2)        # -> (B, 128, 128, 128)
-        # 可调权重版本
-        merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)  # -> (B, 384, 128, 128)
-        conv2 = self.conv2_fusion(merged)         # -> (B, 256, 128, 128)
+        spatial_feat = self.conv2_spatial(down2)  # (B, 256, 128, 128)
+        freq_feat = self.conv2_freq(down2)        # (B, 128, 128, 128)
+        
+        merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1) 
+        conv2 = self.conv2_fusion(merged)         # (B, 256, 128, 128)
         # === End FCB Forward ===
         
-        # 🔥 如果有文本条件,进行融合
-        if text_emb is not None:
-            B, C, H, W = conv2.shape
-            # 将text_emb [B, 256] reshape成 [B, 256, 1, 1] 并广播
-            text_cond = text_emb.view(B, -1, 1, 1).expand(B, -1, H, W)
-            # 使用1x1卷积投影
-            text_feat = self.text_proj(text_cond)
-            conv2 = conv2 + 0.1 * text_feat  # 加权融合
+        # 🔥 [FiLM Forward]
+        conv2 = self.film_bottleneck(conv2, text_emb)
 
         up1 = self.up1(conv2, conv1)
         condition3 = self.mlp3(time_emb)
@@ -285,7 +311,7 @@ class Network(nn.Module):
                  y_n=200.0,
                  norm_range_max=3072.0,
                  norm_range_min=-1024.0,
-                 text_emb_dim=256):  # 🔥 添加参数
+                 text_emb_dim=256):
         super(Network, self).__init__()
         self.unet = UNet(in_channels=in_channels, 
                         out_channels=out_channels,
@@ -294,7 +320,7 @@ class Network(nn.Module):
                         y_n=y_n,
                         norm_range_max=norm_range_max,
                         norm_range_min=norm_range_min,
-                        text_emb_dim=text_emb_dim)  # 🔥 传入参数
+                        text_emb_dim=text_emb_dim)
         self.context = context
         
         self.reg_max = reg_max
