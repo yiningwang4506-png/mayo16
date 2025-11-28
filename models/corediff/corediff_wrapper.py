@@ -9,40 +9,50 @@ sys.path.append('.')
 from FCB import FCB
 
 
-# 🔥 [新增 & 优化] FiLM 层定义 (带零初始化)
+# ============================================================
+# 🔥 改进版 FiLM 层 - 最小改动，只改初始化
+# ============================================================
 class FiLMLayer(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    """
+    Feature-wise Linear Modulation (FiLM)
+    
+    关键改进：极小值初始化 + 残差式调制
+    - 零初始化问题：梯度信号太弱，参数学不动
+    - 大值初始化问题：训练初期扰动太大，容易崩
+    - 解决方案：极小值初始化 + 可学习残差权重
+    """
+    def __init__(self, text_dim, feature_dim):
         super(FiLMLayer, self).__init__()
-        # input_dim: 文本维度 (256)
-        # output_dim: 特征图通道数 (256)
-        self.layer = nn.Linear(input_dim, output_dim * 2)
-
-        # 🔥🔥🔥 关键修改：零初始化 🔥🔥🔥
-        # 这保证了训练初始阶段 gamma=0, beta=0
-        # 使得 output = (1+0)*x + 0 = x
-        # 这样起步就是 Baseline 水平，只会变好，不会变差！
-        nn.init.zeros_(self.layer.weight)
-        nn.init.zeros_(self.layer.bias)
+        
+        # 简单的线性层：text_dim -> feature_dim * 2 (gamma和beta)
+        self.fc = nn.Linear(text_dim, feature_dim * 2)
+        
+        # 🔥 关键改进1：极小值初始化（不是零，但很小）
+        nn.init.normal_(self.fc.weight, mean=0, std=0.001)
+        nn.init.zeros_(self.fc.bias)
+        
+        # 🔥 关键改进2：可学习的残差权重，初始化为很小的值
+        self.residual_weight = nn.Parameter(torch.tensor(0.01))
+        
+        self.feature_dim = feature_dim
 
     def forward(self, x, text_emb):
-        """
-        x: [B, C, H, W] - 图像特征
-        text_emb: [B, input_dim] - 文本向量
-        """
         if text_emb is None:
             return x
-            
-        # 1. 计算调制参数 [B, C*2]
-        params = self.layer(text_emb)
         
-        # 2. Reshape 并分割为 gamma 和 beta
-        # params: [B, 2*C] -> [B, 2*C, 1, 1]
-        params = params.unsqueeze(2).unsqueeze(3)
-        # gamma, beta: 各自 [B, C, 1, 1]
+        B, C, H, W = x.shape
+        
+        params = self.fc(text_emb)  # [B, C*2]
         gamma, beta = params.chunk(2, dim=1)
         
-        # 3. FiLM 调制公式: (1 + gamma) * x + beta
-        return (1 + gamma) * x + beta
+        gamma = gamma.view(B, C, 1, 1)
+        beta = beta.view(B, C, 1, 1)
+        
+        # 🔥 残差式FiLM：output = x + weight * (gamma * x + beta)
+        # 初始时weight=0.01，影响很小，训练稳定
+        modulated = x + self.residual_weight * (gamma * x + beta)
+        
+        return modulated
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -79,14 +89,10 @@ class up(nn.Module):
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
-
-        # input is CHW
         diffY = x2.size()[2] - x1.size()[2]
         diffX = x2.size()[3] - x1.size()[3]
-
         x1 = F.pad(x1, (diffX // 2, diffX - diffX // 2,
                         diffY // 2, diffY - diffY // 2))
-
         x = x2 + x1
         return x
 
@@ -104,20 +110,16 @@ class outconv(nn.Module):
 class adjust_net(nn.Module):
     def __init__(self, out_channels=64, middle_channels=32):
         super(adjust_net, self).__init__()
-
         self.model = nn.Sequential(
             nn.Conv2d(2, middle_channels, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.AvgPool2d(2),
-
             nn.Conv2d(middle_channels, middle_channels*2, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.AvgPool2d(2),
-
             nn.Conv2d(middle_channels*2, middle_channels*4, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.AvgPool2d(2),
-
             nn.Conv2d(middle_channels*4, out_channels*2, 1, padding=0)
         )
 
@@ -139,7 +141,6 @@ class UNet(nn.Module):
                  text_emb_dim=256):
         super(UNet, self).__init__()
 
-        # DRL parameters
         self.reg_max = reg_max
         self.y_0 = y_0
         self.y_n = y_n
@@ -178,7 +179,7 @@ class UNet(nn.Module):
         )
         self.adjust2 = adjust_net(128)
         
-        # === FCB Integration ===
+        # === FCB (完全不变) ===
         self.conv2_spatial = nn.Sequential(
             single_conv(128, 256),
             single_conv(256, 256),
@@ -199,9 +200,8 @@ class UNet(nn.Module):
             single_conv(256, 256),
             single_conv(256, 256)
         )
-        # === End FCB Integration ===
         
-        # 🔥 [FiLM层初始化]
+        # 🔥 单点FiLM注入（位置不变，只改了FiLM内部实现）
         self.film_bottleneck = FiLMLayer(text_emb_dim, 256)
 
         self.up1 = up(256)
@@ -227,7 +227,7 @@ class UNet(nn.Module):
             single_conv(64, 64)
         )
 
-        # DRL output layer
+        # DRL (完全不变)
         self.outc = outconv(64, self.reg_max + 1)
         self.outc.conv.bias.data[:] = 1.0
         
@@ -262,15 +262,13 @@ class UNet(nn.Module):
         else:
             down2 = down2 + condition2
         
-        # === FCB Forward ===
-        spatial_feat = self.conv2_spatial(down2)  # (B, 256, 128, 128)
-        freq_feat = self.conv2_freq(down2)        # (B, 128, 128, 128)
-        
+        # FCB Forward (不变)
+        spatial_feat = self.conv2_spatial(down2)
+        freq_feat = self.conv2_freq(down2)
         merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1) 
-        conv2 = self.conv2_fusion(merged)         # (B, 256, 128, 128)
-        # === End FCB Forward ===
+        conv2 = self.conv2_fusion(merged)
         
-        # 🔥 [FiLM Forward]
+        # 🔥 FiLM注入（位置不变）
         conv2 = self.film_bottleneck(conv2, text_emb)
 
         up1 = self.up1(conv2, conv1)
@@ -295,7 +293,7 @@ class UNet(nn.Module):
             up2 = up2 + condition4
         conv4 = self.conv4(up2)
 
-        # DRL output
+        # DRL output (不变)
         out = self.outc(conv4)
         out_dist = out.permute(0, 2, 3, 1)
         out = out_dist.softmax(3).matmul(self.proj.view([-1, 1]))
@@ -352,5 +350,4 @@ class WeightNet(nn.Module):
         weights = F.softmax(self.weights, 1)
         out = weights * x
         out = out.sum(dim=1, keepdim=True)
-
         return out, weights
