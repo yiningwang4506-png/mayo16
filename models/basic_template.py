@@ -73,9 +73,9 @@ class TrainTask(object):
         parser.add_argument('--dose', type=str, default='25',
                             help='dose%% data use for training and testing (comma-separated for mixed training, e.g., "25,50")')
 
-        # 🔥 新增：文本条件参数
+        # 🔥 Dose conditioning 参数 (复用 use_text_condition 名称以保持兼容)
         parser.add_argument('--use_text_condition', action='store_true',
-                            help='use text condition for multi-dose/multi-site generalization')
+                            help='use dose embedding for multi-dose generalization')
 
         return parser
 
@@ -100,13 +100,13 @@ class TrainTask(object):
         
         print(f"✅ Using dose levels: {dose_list}")
 
-        # 🔥 根据是否启用文本条件选择数据集
+        # 🔥 根据是否启用 dose conditioning 选择数据集
         if opt.use_text_condition:
             import sys
-            sys.path.append('/root/autodl-tmp/CoreDiff-main')
-            from text_conditioned_dataset import TextConditionedCTDataset
-            DatasetClass = TextConditionedCTDataset
-            print("✅ Using text-conditioned dataset")
+            sys.path.append(osp.dirname(osp.dirname(osp.abspath(__file__))))
+            from dose_conditioned_dataset import DoseConditionedCTDataset
+            DatasetClass = DoseConditionedCTDataset
+            print("✅ Using Dose-Conditioned dataset")
         else:
             from utils.dataset import CTDataset
             DatasetClass = CTDataset
@@ -119,6 +119,7 @@ class TrainTask(object):
                 test_id=opt.test_id,
                 dose=dose_list,
                 context=opt.context,
+                use_text=opt.use_text_condition if opt.use_text_condition else False,
             )
             train_sampler = RandomSampler(dataset=train_dataset, batch_size=opt.batch_size,
                                           num_iter=opt.max_iter,
@@ -140,7 +141,8 @@ class TrainTask(object):
             mode='test',
             test_id=opt.test_id,
             dose=dose_list,
-            context=opt.context
+            context=opt.context,
+            use_text=opt.use_text_condition if opt.use_text_condition else False,
         )
         test_loader = torch.utils.data.DataLoader(
             dataset=test_dataset,

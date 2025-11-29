@@ -54,7 +54,14 @@ class Diffusion(nn.Module):
 
 
     @torch.no_grad()
-    def sample(self, batch_size=4, img=None, t=None, sampling_routine='ddim', n_iter=1, start_adjust_iter=1, text_emb=None):
+    def sample(self, batch_size=4, img=None, t=None, sampling_routine='ddim', 
+               n_iter=1, start_adjust_iter=1, dose=None):
+        """
+        采样函数
+        
+        Args:
+            dose: [B] - 剂量值，用于条件生成
+        """
         self.denoise_fn.eval()
         if t == None:
             t = self.num_timesteps
@@ -83,9 +90,8 @@ class Diffusion(nn.Module):
                 else:
                     adjust = True
 
-                # denoise_fn now returns (x1_bar, out_dist)
-                # We only need x1_bar for sampling
-                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, text_emb=text_emb)
+                # 🔥 传入 dose 参数
+                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, dose=dose)
                 x2_bar = self.get_x2_bar_from_xt(x1_bar, img, step)
 
                 xt_bar = x1_bar
@@ -117,9 +123,8 @@ class Diffusion(nn.Module):
                 else:
                     adjust = True
 
-                # denoise_fn now returns (x1_bar, out_dist)
-                # We only need x1_bar for sampling
-                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, text_emb=text_emb)
+                # 🔥 传入 dose 参数
+                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, dose=dose)
                 x2_bar = noise
 
                 xt_bar = x1_bar
@@ -140,15 +145,17 @@ class Diffusion(nn.Module):
         return img.clamp(0., 1.), torch.stack(direct_recons), torch.stack(imstep_imgs)
 
 
-    def forward(self, x, y, n_iter, only_adjust_two_step=False, start_adjust_iter=1, text_emb=None):
+    def forward(self, x, y, n_iter, only_adjust_two_step=False, start_adjust_iter=1, dose=None):
         '''
         Training forward pass with DRL support
-        :param x: low dose image (B, C, H, W) where C=3 if context else C=1
-        :param y: ground truth image (B, 1, H, W)
-        :param n_iter: training iteration
-        :param only_adjust_two_step: only use the EMM module in the second stage. Default: False
-        :param start_adjust_iter: the number of iterations to start training the EMM module. Default: 1
-        :param text_emb: text embedding (B, 256) for text-conditioned training. Default: None
+        
+        Args:
+            x: low dose image (B, C, H, W) where C=3 if context else C=1
+            y: ground truth image (B, 1, H, W)
+            n_iter: training iteration
+            only_adjust_two_step: only use the EMM module in the second stage. Default: False
+            start_adjust_iter: the number of iterations to start training the EMM module. Default: 1
+            dose: [B] - 剂量值 (25, 50等)
         
         Returns:
             x_recon: (B, 1, H, W) - stage I prediction
@@ -166,27 +173,24 @@ class Diffusion(nn.Module):
         t = t_single.repeat((b,))
         
         if self.context:
-            # x: (B, 3, H, W) -> extract middle slice as x_end
-            x_end = x[:, 1].unsqueeze(1)  # (B, 1, H, W)
-            x_mix = self.q_sample(x_start=y, x_end=x_end, t=t)  # (B, 1, H, W)
-            # Concatenate with context slices
-            x_mix = torch.cat((x[:, 0].unsqueeze(1), x_mix, x[:, 2].unsqueeze(1)), dim=1)  # (B, 3, H, W)
+            x_end = x[:, 1].unsqueeze(1)
+            x_mix = self.q_sample(x_start=y, x_end=x_end, t=t)
+            x_mix = torch.cat((x[:, 0].unsqueeze(1), x_mix, x[:, 2].unsqueeze(1)), dim=1)
         else:
-            # x: (B, 1, H, W)
             x_end = x
-            x_mix = self.q_sample(x_start=y, x_end=x_end, t=t)  # (B, 1, H, W)
+            x_mix = self.q_sample(x_start=y, x_end=x_end, t=t)
 
         # Stage I
         if only_adjust_two_step or n_iter < start_adjust_iter:
-            # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
-            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=False, text_emb=text_emb)
+            # 🔥 传入 dose 参数
+            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=False, dose=dose)
         else:
             if t[0] == self.num_timesteps - 1:
                 adjust = False
             else:
                 adjust = True
-            # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
-            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=adjust, text_emb=text_emb)
+            # 🔥 传入 dose 参数
+            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=adjust, dose=dose)
 
         # Stage II
         if n_iter >= start_adjust_iter and t_single.item() >= 1:
@@ -194,18 +198,15 @@ class Diffusion(nn.Module):
             t_sub1[t_sub1 < 0] = 0
 
             if self.context:
-                # x_recon: (B, 1, H, W)
-                x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)  # (B, 1, H, W)
-                # Concatenate with context slices
-                x_mix_sub1 = torch.cat((x[:, 0].unsqueeze(1), x_mix_sub1, x[:, 2].unsqueeze(1)), dim=1)  # (B, 3, H, W)
+                x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)
+                x_mix_sub1 = torch.cat((x[:, 0].unsqueeze(1), x_mix_sub1, x[:, 2].unsqueeze(1)), dim=1)
             else:
-                x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)  # (B, 1, H, W)
+                x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)
 
-            # Returns: (B, 1, H, W), (B, H, W, reg_max+1)
-            x_recon_sub1, out_dist_2 = self.denoise_fn(x_mix_sub1, t_sub1, x_recon, x_end, adjust=True, text_emb=text_emb)
+            # 🔥 传入 dose 参数
+            x_recon_sub1, out_dist_2 = self.denoise_fn(x_mix_sub1, t_sub1, x_recon, x_end, adjust=True, dose=dose)
         else:
             x_recon_sub1, x_mix_sub1 = x_recon, x_mix
             out_dist_2 = out_dist_1
 
-        # Return 6 values: predictions, mixed inputs, and distributions
         return x_recon, x_mix, x_recon_sub1, x_mix_sub1, out_dist_1, out_dist_2

@@ -15,11 +15,6 @@ from models.basic_template import TrainTask
 from .corediff_wrapper import Network, WeightNet
 from .diffusion_modules import Diffusion
 
-# 🔥 新增导入
-import sys
-sys.path.append('/root/autodl-tmp/CoreDiff-main')
-from medical_text_encoder import MedicalTextEncoder
-
 import wandb
 
 
@@ -69,6 +64,7 @@ class corediff(TrainTask):
         self.sampling_routine = opt.sampling_routine
         self.context = opt.context
         
+        # 🔥 使用 dose_emb_dim 而不是 text_emb_dim
         denoise_fn = Network(
             in_channels=opt.in_channels, 
             context=opt.context,
@@ -77,7 +73,7 @@ class corediff(TrainTask):
             y_n=opt.y_n,
             norm_range_max=opt.norm_range_max,
             norm_range_min=opt.norm_range_min,
-            text_emb_dim=256
+            dose_emb_dim=256  # Dose embedding 维度
         )
 
         model = Diffusion(
@@ -98,18 +94,12 @@ class corediff(TrainTask):
         self.lossfn = nn.MSELoss()
         self.lossfn_sub1 = nn.MSELoss()
         
-        # 🔥 添加文本编码器（如果启用）
-        self.use_text = getattr(opt, 'use_text_condition', False)
-        if self.use_text:
-            self.text_encoder = MedicalTextEncoder(
-                output_dim=256,
-                freeze_bert=True,
-                cache_dir='/root/autodl-tmp/CoreDiff-main/pretrained_models'
-            ).cuda()
-            print("✅ Text encoder initialized")
+        # 🔥 检查是否使用 dose condition
+        self.use_dose_condition = getattr(opt, 'use_text_condition', False)
+        if self.use_dose_condition:
+            print("✅ Dose Embedding conditioning ENABLED")
         else:
-            self.text_encoder = None
-            print("✅ Standard training mode (no text condition)")
+            print("✅ Standard training mode (no dose condition)")
         
         # DRL parameters for DFL loss
         self.use_dfl_loss = opt.use_dfl_loss
@@ -136,31 +126,15 @@ class corediff(TrainTask):
     
     def compute_dfl_loss(self, out_dist, y, x):
         """
-        计算Distribution Focal Loss
-        
-        Args:
-            out_dist: (B, 19, H, W) 网络输出的分布logits
-            y: (B, 1, H, W) 全剂量CT图像 [0,1]
-            x: (B, 1, H, W) 低剂量CT图像 [0,1]
+        计算Distribution Focal Loss (完全保持不变)
         """
-        
-        # ================== 步骤1: HU空间转换 ==================
         x_HU = x * 4096.0 - 1024.0
         y_HU = y * 4096.0 - 1024.0
         residual_HU = y_HU - x_HU
         
-       
-        
-        # ================== 步骤2: 离散化到Bin ==================
         bin_idx_raw = (residual_HU - self.y_0) / self.hu_interval
         bin_idx = torch.clamp(bin_idx_raw, 0, self.reg_max)
         
-        out_of_range = ((bin_idx_raw < 0) | (bin_idx_raw > self.reg_max)).float()
-        out_ratio = out_of_range.mean().item() * 100
-        
-
-        
-        # ================== 步骤3: 生成目标分布 ==================
         B, C, H, W = bin_idx.shape
         bin_idx_flat = bin_idx.reshape(-1)
         
@@ -172,22 +146,14 @@ class corediff(TrainTask):
         target_dist_flat.scatter_(1, left.unsqueeze(1), (1 - weight_right).unsqueeze(1))
         target_dist_flat.scatter_(1, right.unsqueeze(1), weight_right.unsqueeze(1))
         
-        # ================== 步骤4: 网络预测分布 ==================
-        pred_dist = torch.softmax(out_dist, dim=1)  # (B, 19, H, W)
+        pred_dist = torch.softmax(out_dist, dim=1)
         pred_dist_flat = pred_dist.permute(0, 2, 3, 1).reshape(-1, self.reg_max + 1)
         
-        entropy = -(pred_dist_flat * torch.log(pred_dist_flat + 1e-8)).sum(-1).mean()
-        max_prob = pred_dist_flat.max(-1)[0].mean()
-        
-
-        
-        # ================== 步骤5: 计算损失 ==================
         B_out, C_out, H_out, W_out = out_dist.shape
         out_dist_flat = out_dist.permute(0, 2, 3, 1).reshape(-1, self.reg_max + 1)
         
         loss = -(target_dist_flat * torch.log_softmax(out_dist_flat, dim=-1)).sum(-1).mean()
         loss = loss * 0.0001
-
         
         return loss
 
@@ -198,30 +164,27 @@ class corediff(TrainTask):
         
         # 🔥 兼容新旧数据格式
         if isinstance(inputs, dict):
-            # 新格式（文本条件）
+            # 新格式（带dose的dict）
             low_dose = inputs['input'].cuda()
             full_dose = inputs['target'].cuda()
-            text_descriptions = inputs.get('description', None)
             
-            # 编码文本
-            if self.use_text and text_descriptions is not None:
-                with torch.no_grad():  # 冻结BERT，不需要梯度
-                    text_emb = self.text_encoder(text_descriptions)  # [B, 256]
+            # 🔥 获取 dose 值
+            if self.use_dose_condition and 'dose' in inputs:
+                dose = inputs['dose'].float().cuda()  # [B]
             else:
-                text_emb = None
+                dose = None
         else:
             # 旧格式（向后兼容）
             low_dose, full_dose = inputs
             low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
-            text_emb = None
+            dose = None
 
-        ## Training process of CoreDiff with DRL
-        # Returns: gen_full_dose, x_mix, gen_full_dose_sub1, x_mix_sub1, out_dist_1, out_dist_2
+        # 🔥 传入 dose 参数
         gen_full_dose, x_mix, gen_full_dose_sub1, x_mix_sub1, out_dist_1, out_dist_2 = self.model(
             low_dose, full_dose, n_iter,
             only_adjust_two_step=opt.only_adjust_two_step,
             start_adjust_iter=opt.start_adjust_iter,
-            text_emb=text_emb  # 🔥 传入文本条件
+            dose=dose
         )
 
         # MSE loss
@@ -232,36 +195,22 @@ class corediff(TrainTask):
         
         # DFL loss (optional)
         if self.use_dfl_loss:
-        # Get the middle slice if using context
             if self.context:
                 x_middle = low_dose[:, 1].unsqueeze(1)
             else:
                 x_middle = low_dose
         
-            # Calculate DFL loss for both stages
             loss_dfl_1 = self.compute_dfl_loss(out_dist_1, full_dose, x_middle)
             loss_dfl_2 = self.compute_dfl_loss(out_dist_2, full_dose, x_middle)
             loss_dfl = 0.5 * loss_dfl_1 + 0.5 * loss_dfl_2
             
             loss = loss_mse + self.dfl_weight * loss_dfl
             
-            # 添加这些检查（在backward之前）
-            if n_iter % 100 == 1:  # 每100步打印一次
-                print(f"\n{'='*60}")
-                print(f"[梯度检查 - Iter {n_iter}]")
-                print(f"{'='*60}")
-                print(f"out_dist_1.requires_grad: {out_dist_1.requires_grad}")
-                print(f"out_dist_2.requires_grad: {out_dist_2.requires_grad}")
-                print(f"loss_dfl_1.requires_grad: {loss_dfl_1.requires_grad}")
-                print(f"loss_dfl_2.requires_grad: {loss_dfl_2.requires_grad}")
-                print(f"loss_dfl.requires_grad: {loss_dfl.requires_grad}")
-                print(f"loss.requires_grad: {loss.requires_grad}")
-                print(f"loss_mse value: {loss_mse.item():.8f}")
-                print(f"loss_dfl value: {loss_dfl.item():.8f}")
-                print(f"total loss value: {loss.item():.8f}")
-                if self.use_text and text_emb is not None:
-                    print(f"text_emb shape: {text_emb.shape}")
-                print(f"{'='*60}\n")
+            # 调试信息
+            if n_iter % 500 == 1:
+                print(f"\n[Iter {n_iter}] loss_mse: {loss_mse.item():.6f}, loss_dfl: {loss_dfl.item():.6f}")
+                if dose is not None:
+                    print(f"  dose values: {dose.cpu().numpy()}")
 
         loss.backward()
 
@@ -301,18 +250,17 @@ class corediff(TrainTask):
             if isinstance(inputs, dict):
                 low_dose = inputs['input'].cuda()
                 full_dose = inputs['target'].cuda()
-                text_descriptions = inputs.get('text_description', None)
                 
-                if self.use_text and text_descriptions is not None:
-                    with torch.no_grad():
-                        text_emb = self.text_encoder(text_descriptions)
+                if self.use_dose_condition and 'dose' in inputs:
+                    dose = inputs['dose'].float().cuda()
                 else:
-                    text_emb = None
+                    dose = None
             else:
                 low_dose, full_dose = inputs
                 low_dose, full_dose = low_dose.cuda(), full_dose.cuda()
-                text_emb = None
+                dose = None
 
+            # 🔥 传入 dose 参数
             gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
                 img = low_dose,
@@ -320,7 +268,7 @@ class corediff(TrainTask):
                 sampling_routine = self.sampling_routine,
                 n_iter=n_iter,
                 start_adjust_iter=opt.start_adjust_iter,
-                text_emb=text_emb  # 🔥 传入文本条件
+                dose=dose
             )
 
             full_dose = self.transfer_calculate_window(full_dose)
@@ -344,15 +292,13 @@ class corediff(TrainTask):
         self.ema_model.eval()
         low_dose, full_dose = self.test_images
 
-        # 🔥 为可视化生成文本条件（如果启用）
-        if self.use_text:
-            # 假设test_images是单剂量的，使用默认剂量
+        # 🔥 为可视化生成 dose 条件
+        if self.use_dose_condition:
+            # 获取第一个 dose 值
             dose_value = opt.dose if isinstance(opt.dose, int) else int(opt.dose.split(',')[0])
-            text_desc = [f"This is a low-dose CT scan with {dose_value}% radiation dose."] * low_dose.shape[0]
-            with torch.no_grad():
-                text_emb = self.text_encoder(text_desc)
+            dose = torch.full((low_dose.shape[0],), dose_value, dtype=torch.float32, device=low_dose.device)
         else:
-            text_emb = None
+            dose = None
 
         gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
                 batch_size = low_dose.shape[0],
@@ -361,7 +307,7 @@ class corediff(TrainTask):
                 sampling_routine = self.sampling_routine,
                 n_iter=n_iter,
                 start_adjust_iter=opt.start_adjust_iter,
-                text_emb=text_emb  # 🔥 传入文本条件
+                dose=dose
             )
 
         if self.context:
@@ -404,14 +350,14 @@ class corediff(TrainTask):
                     
         low_dose, full_dose = torch.from_numpy(low_dose).unsqueeze(0).cuda(), torch.from_numpy(full_dose).unsqueeze(0).cuda()
 
-        # OSL framework不需要文本条件
+        # OSL framework 不需要 dose 条件
         gen_full_dose, direct_recons, imstep_imgs = self.ema_model.sample(
             batch_size=low_dose.shape[0],
             img=low_dose,
             t=self.T,
             sampling_routine=self.sampling_routine,
             start_adjust_iter=opt.start_adjust_iter,
-            text_emb=None
+            dose=None
         )
 
         inputs = imstep_imgs.transpose(0, 2).squeeze(0)
@@ -494,7 +440,7 @@ class corediff(TrainTask):
                 sampling_routine=self.sampling_routine,
                 n_iter=test_iter,
                 start_adjust_iter=opt.start_adjust_iter,
-                text_emb=None  # OSL不需要文本条件
+                dose=None
             )
             imstep_imgs = imstep_imgs[:self.T]
             inputs = imstep_imgs.squeeze(2).transpose(0, 1)
