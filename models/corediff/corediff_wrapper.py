@@ -10,24 +10,20 @@ from FCB import FCB
 
 
 # ============================================================
-# 🔥 Dose Embedding 模块
+# 🔥 Dose Embedding 模块 (保持不变)
 # ============================================================
 class DoseEmbedding(nn.Module):
     """
     将剂量数值编码为embedding向量
-    比文本描述更直接、区分度更高
-    
-    支持的剂量: 5, 10, 25, 50, 100 等
     """
     def __init__(self, embed_dim=256):
         super().__init__()
         self.embed_dim = embed_dim
         
-        # 方式1：可学习的离散剂量embedding
-        # 索引: 0-100 对应 0%-100% 剂量
+        # 可学习的离散剂量embedding
         self.dose_embed = nn.Embedding(101, embed_dim)
         
-        # 方式2：连续剂量的MLP编码（更灵活，处理任意剂量值）
+        # 连续剂量的MLP编码
         self.dose_mlp = nn.Sequential(
             nn.Linear(1, 64),
             nn.GELU(),
@@ -43,24 +39,15 @@ class DoseEmbedding(nn.Module):
         )
         
     def forward(self, dose):
-        """
-        Args:
-            dose: [B] 或 [B, 1] - 剂量值 (25, 50等)
-        Returns:
-            [B, embed_dim] - 剂量embedding
-        """
         if dose.dim() == 1:
-            dose = dose.unsqueeze(1)  # [B, 1]
+            dose = dose.unsqueeze(1)
         
-        # 离散embedding
         dose_int = dose.squeeze(1).long().clamp(0, 100)
-        discrete_emb = self.dose_embed(dose_int)  # [B, embed_dim]
+        discrete_emb = self.dose_embed(dose_int)
         
-        # 连续MLP编码（归一化到0-1）
         dose_norm = dose.float() / 100.0
-        continuous_emb = self.dose_mlp(dose_norm)  # [B, embed_dim]
+        continuous_emb = self.dose_mlp(dose_norm)
         
-        # 融合
         combined = torch.cat([discrete_emb, continuous_emb], dim=1)
         output = self.fusion(combined)
         
@@ -68,14 +55,14 @@ class DoseEmbedding(nn.Module):
 
 
 # ============================================================
-# 🔥 FiLM 层 (带稳定初始化)
+# 🔥 FiLM 层 (增强版 - 更大的初始影响力)
 # ============================================================
 class FiLMLayer(nn.Module):
     """
     Feature-wise Linear Modulation
-    使用残差连接和小值初始化，确保训练稳定
+    增强版：使用更大的初始化，让FiLM更快发挥作用
     """
-    def __init__(self, cond_dim, feature_dim):
+    def __init__(self, cond_dim, feature_dim, init_scale=0.1):
         super(FiLMLayer, self).__init__()
         
         # 两层MLP生成gamma和beta
@@ -85,36 +72,30 @@ class FiLMLayer(nn.Module):
             nn.Linear(feature_dim, feature_dim * 2)
         )
         
-        # 🔥 关键：小值初始化，确保起步接近baseline
-        nn.init.normal_(self.fc[2].weight, mean=0, std=0.01)
+        # 🔥 关键改动：更大的初始化 (从0.01改为init_scale)
+        nn.init.normal_(self.fc[2].weight, mean=0, std=init_scale)
         nn.init.zeros_(self.fc[2].bias)
         
         self.feature_dim = feature_dim
 
     def forward(self, x, cond):
-        """
-        Args:
-            x: [B, C, H, W] - 特征图
-            cond: [B, cond_dim] - 条件向量 (dose embedding)
-        """
         if cond is None:
             return x
         
         B, C, H, W = x.shape
         
-        params = self.fc(cond)  # [B, C*2]
+        params = self.fc(cond)
         gamma, beta = params.chunk(2, dim=1)
         
         gamma = gamma.view(B, C, 1, 1)
         beta = beta.view(B, C, 1, 1)
         
-        # 标准FiLM: (1 + gamma) * x + beta
-        # gamma初始化接近0，所以起步时接近identity
+        # 标准FiLM公式
         return (1 + gamma) * x + beta
 
 
 # ============================================================
-# 原有模块 (保持不变)
+# 原有模块 (完全保持不变)
 # ============================================================
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -193,7 +174,7 @@ class adjust_net(nn.Module):
 
 
 # ============================================================
-# UNet (添加 Dose Embedding)
+# UNet (🔥 多层 FiLM 注入)
 # ============================================================
 class UNet(nn.Module):
     def __init__(self, in_channels=2, out_channels=1,
@@ -212,7 +193,7 @@ class UNet(nn.Module):
         self.norm_range_max = norm_range_max
         self.norm_range_min = norm_range_min
         
-        # 🔥 Dose Embedding 模块
+        # Dose Embedding 模块
         self.dose_embedding = DoseEmbedding(embed_dim=dose_emb_dim)
 
         dim = 32
@@ -264,15 +245,32 @@ class UNet(nn.Module):
         )
         
         self.conv2_fusion = nn.Sequential(
-            single_conv(384, 256),  # 256 + 128 = 384
+            single_conv(384, 256),
             single_conv(256, 256),
             single_conv(256, 256)
         )
         # === End FCB Integration ===
         
-        # 🔥 FiLM层 - 在bottleneck和decoder注入dose condition
-        self.film_bottleneck = FiLMLayer(dose_emb_dim, 256)
-        self.film_decoder = FiLMLayer(dose_emb_dim, 128)
+        # 🔥🔥🔥 多层 FiLM 注入 🔥🔥🔥
+        # 
+        # 网络结构:
+        #   inc (64ch) → film_enc0
+        #   ↓ down1
+        #   conv1 (128ch) → film_enc1  
+        #   ↓ down2
+        #   conv2/FCB (256ch) → film_bottleneck (最重要的位置)
+        #   ↑ up1
+        #   conv3 (128ch) → film_dec1
+        #   ↑ up2
+        #   conv4 (64ch) → film_dec2
+        #   ↓
+        #   output
+        #
+        self.film_enc0 = FiLMLayer(dose_emb_dim, 64, init_scale=0.05)      # encoder第一层
+        self.film_enc1 = FiLMLayer(dose_emb_dim, 128, init_scale=0.05)     # encoder第二层
+        self.film_bottleneck = FiLMLayer(dose_emb_dim, 256, init_scale=0.1)  # bottleneck (最重要)
+        self.film_dec1 = FiLMLayer(dose_emb_dim, 128, init_scale=0.05)     # decoder第一层
+        self.film_dec2 = FiLMLayer(dose_emb_dim, 64, init_scale=0.05)      # decoder第二层
 
         self.up1 = up(256)
         self.mlp3 = nn.Sequential(
@@ -308,21 +306,16 @@ class UNet(nn.Module):
         self.hu_interval = (y_n - y_0) / self.reg_max
 
     def forward(self, x, t, x_adjust, adjust, dose=None):
-        """
-        Args:
-            x: 输入图像
-            t: 时间步
-            x_adjust: adjust网络的输入
-            adjust: 是否使用adjust
-            dose: [B] - 剂量值 (25, 50等)，如果为None则不使用dose condition
-        """
-        # 🔥 计算 dose embedding
+        # 计算 dose embedding
         if dose is not None:
-            dose_emb = self.dose_embedding(dose)  # [B, 256]
+            dose_emb = self.dose_embedding(dose)
         else:
             dose_emb = None
         
+        # ============ Encoder ============
         inx = self.inc(x)
+        inx = self.film_enc0(inx, dose_emb)  # 🔥 FiLM注入点1: encoder入口
+        
         time_emb = self.time_mlp(t)
         
         down1 = self.down1(inx)
@@ -335,6 +328,7 @@ class UNet(nn.Module):
         else:
             down1 = down1 + condition1
         conv1 = self.conv1(down1)
+        conv1 = self.film_enc1(conv1, dose_emb)  # 🔥 FiLM注入点2: encoder中间
 
         down2 = self.down2(conv1)
         condition2 = self.mlp2(time_emb)
@@ -347,16 +341,16 @@ class UNet(nn.Module):
             down2 = down2 + condition2
         
         # === FCB Forward (完全保持不变) ===
-        spatial_feat = self.conv2_spatial(down2)  # (B, 256, 128, 128)
-        freq_feat = self.conv2_freq(down2)        # (B, 128, 128, 128)
-        
+        spatial_feat = self.conv2_spatial(down2)
+        freq_feat = self.conv2_freq(down2)
         merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1) 
-        conv2 = self.conv2_fusion(merged)         # (B, 256, 128, 128)
+        conv2 = self.conv2_fusion(merged)
         # === End FCB Forward ===
         
-        # 🔥 FiLM注入点1: bottleneck
+        # 🔥 FiLM注入点3: bottleneck (最重要的位置)
         conv2 = self.film_bottleneck(conv2, dose_emb)
 
+        # ============ Decoder ============
         up1 = self.up1(conv2, conv1)
         condition3 = self.mlp3(time_emb)
         b, c = condition3.shape
@@ -367,9 +361,7 @@ class UNet(nn.Module):
         else:
             up1 = up1 + condition3
         conv3 = self.conv3(up1)
-        
-        # 🔥 FiLM注入点2: decoder
-        conv3 = self.film_decoder(conv3, dose_emb)
+        conv3 = self.film_dec1(conv3, dose_emb)  # 🔥 FiLM注入点4: decoder中间
 
         up2 = self.up2(conv3, inx)
         condition4 = self.mlp4(time_emb)
@@ -381,6 +373,7 @@ class UNet(nn.Module):
         else:
             up2 = up2 + condition4
         conv4 = self.conv4(up2)
+        conv4 = self.film_dec2(conv4, dose_emb)  # 🔥 FiLM注入点5: decoder出口
 
         # DRL output (完全保持不变)
         out = self.outc(conv4)
@@ -417,15 +410,6 @@ class Network(nn.Module):
         self.norm_range_min = norm_range_min
 
     def forward(self, x, t, y, x_end, adjust=True, dose=None):
-        """
-        Args:
-            x: 输入图像
-            t: 时间步
-            y: ground truth
-            x_end: 噪声端
-            adjust: 是否使用adjust
-            dose: [B] - 剂量值 (25, 50等)
-        """
         if self.context:
             x_middle = x[:, 1].unsqueeze(1)
         else:
