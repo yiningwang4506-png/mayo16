@@ -10,92 +10,52 @@ from FCB import FCB
 
 
 # ============================================================
-# 🔥 Dose Embedding 模块 (保持不变)
-# ============================================================
-class DoseEmbedding(nn.Module):
-    """
-    将剂量数值编码为embedding向量
-    """
-    def __init__(self, embed_dim=256):
-        super().__init__()
-        self.embed_dim = embed_dim
-        
-        # 可学习的离散剂量embedding
-        self.dose_embed = nn.Embedding(101, embed_dim)
-        
-        # 连续剂量的MLP编码
-        self.dose_mlp = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.GELU(),
-            nn.Linear(64, 128),
-            nn.GELU(),
-            nn.Linear(128, embed_dim)
-        )
-        
-        # 融合两种编码
-        self.fusion = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.LayerNorm(embed_dim)
-        )
-        
-    def forward(self, dose):
-        if dose.dim() == 1:
-            dose = dose.unsqueeze(1)
-        
-        dose_int = dose.squeeze(1).long().clamp(0, 100)
-        discrete_emb = self.dose_embed(dose_int)
-        
-        dose_norm = dose.float() / 100.0
-        continuous_emb = self.dose_mlp(dose_norm)
-        
-        combined = torch.cat([discrete_emb, continuous_emb], dim=1)
-        output = self.fusion(combined)
-        
-        return output
-
-
-# ============================================================
-# 🔥 FiLM 层 (增强版 - 更大的初始影响力)
+# FiLM 层 - 用于注入文本条件
 # ============================================================
 class FiLMLayer(nn.Module):
     """
     Feature-wise Linear Modulation
-    增强版：使用更大的初始化，让FiLM更快发挥作用
+    用文本条件调制特征图
     """
-    def __init__(self, cond_dim, feature_dim, init_scale=0.1):
+    def __init__(self, cond_dim, feature_dim):
         super(FiLMLayer, self).__init__()
         
-        # 两层MLP生成gamma和beta
         self.fc = nn.Sequential(
             nn.Linear(cond_dim, feature_dim),
             nn.GELU(),
             nn.Linear(feature_dim, feature_dim * 2)
         )
         
-        # 🔥 关键改动：更大的初始化 (从0.01改为init_scale)
-        nn.init.normal_(self.fc[2].weight, mean=0, std=init_scale)
+        # 初始化：让 gamma 接近 0，beta 接近 0
+        # 这样初始时 FiLM 接近恒等映射
+        nn.init.zeros_(self.fc[2].weight)
         nn.init.zeros_(self.fc[2].bias)
         
         self.feature_dim = feature_dim
 
     def forward(self, x, cond):
+        """
+        Args:
+            x: [B, C, H, W] 特征图
+            cond: [B, cond_dim] 文本条件
+        """
         if cond is None:
             return x
         
         B, C, H, W = x.shape
         
-        params = self.fc(cond)
-        gamma, beta = params.chunk(2, dim=1)
+        params = self.fc(cond)  # [B, C*2]
+        gamma, beta = params.chunk(2, dim=1)  # 各 [B, C]
         
         gamma = gamma.view(B, C, 1, 1)
         beta = beta.view(B, C, 1, 1)
         
-        # 标准FiLM公式
+        # FiLM: (1 + gamma) * x + beta
         return (1 + gamma) * x + beta
 
 
 # ============================================================
-# 原有模块 (完全保持不变)
+# 基础模块（保持不变）
 # ============================================================
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -174,7 +134,7 @@ class adjust_net(nn.Module):
 
 
 # ============================================================
-# UNet (🔥 多层 FiLM 注入)
+# UNet（支持 Text Condition）
 # ============================================================
 class UNet(nn.Module):
     def __init__(self, in_channels=2, out_channels=1,
@@ -183,19 +143,16 @@ class UNet(nn.Module):
                  y_n=200.0,
                  norm_range_max=3072.0,
                  norm_range_min=-1024.0,
-                 dose_emb_dim=256):
+                 text_emb_dim=None):  # 🔥 新增参数
         super(UNet, self).__init__()
 
-        # DRL parameters (完全保持不变)
         self.reg_max = reg_max
         self.y_0 = y_0
         self.y_n = y_n
         self.norm_range_max = norm_range_max
         self.norm_range_min = norm_range_min
+        self.use_text_condition = text_emb_dim is not None
         
-        # Dose Embedding 模块
-        self.dose_embedding = DoseEmbedding(embed_dim=dose_emb_dim)
-
         dim = 32
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(dim),
@@ -228,7 +185,7 @@ class UNet(nn.Module):
         )
         self.adjust2 = adjust_net(128)
         
-        # === FCB Integration (完全保持不变) ===
+        # FCB 分支
         self.conv2_spatial = nn.Sequential(
             single_conv(128, 256),
             single_conv(256, 256),
@@ -249,28 +206,13 @@ class UNet(nn.Module):
             single_conv(256, 256),
             single_conv(256, 256)
         )
-        # === End FCB Integration ===
         
-        # 🔥🔥🔥 多层 FiLM 注入 🔥🔥🔥
-        # 
-        # 网络结构:
-        #   inc (64ch) → film_enc0
-        #   ↓ down1
-        #   conv1 (128ch) → film_enc1  
-        #   ↓ down2
-        #   conv2/FCB (256ch) → film_bottleneck (最重要的位置)
-        #   ↑ up1
-        #   conv3 (128ch) → film_dec1
-        #   ↑ up2
-        #   conv4 (64ch) → film_dec2
-        #   ↓
-        #   output
-        #
-        self.film_enc0 = FiLMLayer(dose_emb_dim, 64, init_scale=0.05)      # encoder第一层
-        self.film_enc1 = FiLMLayer(dose_emb_dim, 128, init_scale=0.05)     # encoder第二层
-        self.film_bottleneck = FiLMLayer(dose_emb_dim, 256, init_scale=0.1)  # bottleneck (最重要)
-        self.film_dec1 = FiLMLayer(dose_emb_dim, 128, init_scale=0.05)     # decoder第一层
-        self.film_dec2 = FiLMLayer(dose_emb_dim, 64, init_scale=0.05)      # decoder第二层
+        # 🔥 FiLM 层（如果启用 text condition）
+        if self.use_text_condition:
+            self.film_enc1 = FiLMLayer(text_emb_dim, 128)
+            self.film_bottleneck = FiLMLayer(text_emb_dim, 256)
+            self.film_dec1 = FiLMLayer(text_emb_dim, 128)
+            self.film_dec2 = FiLMLayer(text_emb_dim, 64)
 
         self.up1 = up(256)
         self.mlp3 = nn.Sequential(
@@ -295,7 +237,7 @@ class UNet(nn.Module):
             single_conv(64, 64)
         )
 
-        # DRL output layer (完全保持不变)
+        # DRL output
         self.outc = outconv(64, self.reg_max + 1)
         self.outc.conv.bias.data[:] = 1.0
         
@@ -305,19 +247,19 @@ class UNet(nn.Module):
         
         self.hu_interval = (y_n - y_0) / self.reg_max
 
-    def forward(self, x, t, x_adjust, adjust, dose=None):
-        # 计算 dose embedding
-        if dose is not None:
-            dose_emb = self.dose_embedding(dose)
-        else:
-            dose_emb = None
-        
-        # ============ Encoder ============
+    def forward(self, x, t, x_adjust, adjust, text_emb=None):
+        """
+        Args:
+            x: [B, C, H, W] 输入
+            t: [B] 时间步
+            x_adjust: [B, 2, H, W] 调整信号
+            adjust: bool 是否使用 adjust_net
+            text_emb: [B, text_emb_dim] 文本条件（可选）
+        """
         inx = self.inc(x)
-        inx = self.film_enc0(inx, dose_emb)  # 🔥 FiLM注入点1: encoder入口
-        
         time_emb = self.time_mlp(t)
         
+        # Encoder
         down1 = self.down1(inx)
         condition1 = self.mlp1(time_emb)
         b, c = condition1.shape
@@ -328,7 +270,10 @@ class UNet(nn.Module):
         else:
             down1 = down1 + condition1
         conv1 = self.conv1(down1)
-        conv1 = self.film_enc1(conv1, dose_emb)  # 🔥 FiLM注入点2: encoder中间
+        
+        # 🔥 FiLM 注入点 1: encoder
+        if self.use_text_condition and text_emb is not None:
+            conv1 = self.film_enc1(conv1, text_emb)
 
         down2 = self.down2(conv1)
         condition2 = self.mlp2(time_emb)
@@ -340,17 +285,17 @@ class UNet(nn.Module):
         else:
             down2 = down2 + condition2
         
-        # === FCB Forward (完全保持不变) ===
+        # FCB
         spatial_feat = self.conv2_spatial(down2)
         freq_feat = self.conv2_freq(down2)
-        merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1) 
+        merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)
         conv2 = self.conv2_fusion(merged)
-        # === End FCB Forward ===
         
-        # 🔥 FiLM注入点3: bottleneck (最重要的位置)
-        conv2 = self.film_bottleneck(conv2, dose_emb)
+        # 🔥 FiLM 注入点 2: bottleneck（最重要）
+        if self.use_text_condition and text_emb is not None:
+            conv2 = self.film_bottleneck(conv2, text_emb)
 
-        # ============ Decoder ============
+        # Decoder
         up1 = self.up1(conv2, conv1)
         condition3 = self.mlp3(time_emb)
         b, c = condition3.shape
@@ -361,7 +306,10 @@ class UNet(nn.Module):
         else:
             up1 = up1 + condition3
         conv3 = self.conv3(up1)
-        conv3 = self.film_dec1(conv3, dose_emb)  # 🔥 FiLM注入点4: decoder中间
+        
+        # 🔥 FiLM 注入点 3: decoder
+        if self.use_text_condition and text_emb is not None:
+            conv3 = self.film_dec1(conv3, text_emb)
 
         up2 = self.up2(conv3, inx)
         condition4 = self.mlp4(time_emb)
@@ -373,9 +321,12 @@ class UNet(nn.Module):
         else:
             up2 = up2 + condition4
         conv4 = self.conv4(up2)
-        conv4 = self.film_dec2(conv4, dose_emb)  # 🔥 FiLM注入点5: decoder出口
+        
+        # 🔥 FiLM 注入点 4: output
+        if self.use_text_condition and text_emb is not None:
+            conv4 = self.film_dec2(conv4, text_emb)
 
-        # DRL output (完全保持不变)
+        # DRL output
         out = self.outc(conv4)
         out_dist = out.permute(0, 2, 3, 1)
         out = out_dist.softmax(3).matmul(self.proj.view([-1, 1]))
@@ -391,16 +342,18 @@ class Network(nn.Module):
                  y_n=200.0,
                  norm_range_max=3072.0,
                  norm_range_min=-1024.0,
-                 dose_emb_dim=256):
+                 text_emb_dim=None):  # 🔥 新增
         super(Network, self).__init__()
-        self.unet = UNet(in_channels=in_channels, 
-                        out_channels=out_channels,
-                        reg_max=reg_max,
-                        y_0=y_0,
-                        y_n=y_n,
-                        norm_range_max=norm_range_max,
-                        norm_range_min=norm_range_min,
-                        dose_emb_dim=dose_emb_dim)
+        self.unet = UNet(
+            in_channels=in_channels, 
+            out_channels=out_channels,
+            reg_max=reg_max,
+            y_0=y_0,
+            y_n=y_n,
+            norm_range_max=norm_range_max,
+            norm_range_min=norm_range_min,
+            text_emb_dim=text_emb_dim
+        )
         self.context = context
         
         self.reg_max = reg_max
@@ -409,14 +362,14 @@ class Network(nn.Module):
         self.norm_range_max = norm_range_max
         self.norm_range_min = norm_range_min
 
-    def forward(self, x, t, y, x_end, adjust=True, dose=None):
+    def forward(self, x, t, y, x_end, adjust=True, text_emb=None):
         if self.context:
             x_middle = x[:, 1].unsqueeze(1)
         else:
             x_middle = x
         
         x_adjust = torch.cat((y, x_end), dim=1)
-        out, out_dist = self.unet(x, t, x_adjust, adjust=adjust, dose=dose)
+        out, out_dist = self.unet(x, t, x_adjust, adjust=adjust, text_emb=text_emb)
         out = out + x_middle
 
         return out, out_dist

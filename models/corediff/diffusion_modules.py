@@ -37,14 +37,11 @@ class Diffusion(nn.Module):
         self.register_buffer('alphas_cumprod', alphas_cumprod)
         self.register_buffer('one_minus_alphas_cumprod', 1. - alphas_cumprod)
 
-
-    #  mean-preserving degradation operator
     def q_sample(self, x_start, x_end, t):
         return (
                 extract(self.alphas_cumprod, t, x_start.shape) * x_start +
                 extract(self.one_minus_alphas_cumprod, t, x_start.shape) * x_end
         )
-
 
     def get_x2_bar_from_xt(self, x1_bar, xt, t):
         return (
@@ -52,15 +49,14 @@ class Diffusion(nn.Module):
                 extract(self.one_minus_alphas_cumprod, t, x1_bar.shape)
         )
 
-
     @torch.no_grad()
     def sample(self, batch_size=4, img=None, t=None, sampling_routine='ddim', 
-               n_iter=1, start_adjust_iter=1, dose=None):
+               n_iter=1, start_adjust_iter=1, text_emb=None):
         """
         采样函数
         
         Args:
-            dose: [B] - 剂量值，用于条件生成
+            text_emb: [B, text_emb_dim] 文本条件（可选）
         """
         self.denoise_fn.eval()
         if t == None:
@@ -90,8 +86,8 @@ class Diffusion(nn.Module):
                 else:
                     adjust = True
 
-                # 🔥 传入 dose 参数
-                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, dose=dose)
+                # 🔥 传入 text_emb
+                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, text_emb=text_emb)
                 x2_bar = self.get_x2_bar_from_xt(x1_bar, img, step)
 
                 xt_bar = x1_bar
@@ -123,8 +119,8 @@ class Diffusion(nn.Module):
                 else:
                     adjust = True
 
-                # 🔥 传入 dose 参数
-                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, dose=dose)
+                # 🔥 传入 text_emb
+                x1_bar, _ = self.denoise_fn(full_img, step, x1_bar, noise, adjust=adjust, text_emb=text_emb)
                 x2_bar = noise
 
                 xt_bar = x1_bar
@@ -144,28 +140,16 @@ class Diffusion(nn.Module):
 
         return img.clamp(0., 1.), torch.stack(direct_recons), torch.stack(imstep_imgs)
 
-
-    def forward(self, x, y, n_iter, only_adjust_two_step=False, start_adjust_iter=1, dose=None):
-        '''
-        Training forward pass with DRL support
+    def forward(self, x, y, n_iter, only_adjust_two_step=False, start_adjust_iter=1, text_emb=None):
+        """
+        训练前向传播
         
         Args:
-            x: low dose image (B, C, H, W) where C=3 if context else C=1
-            y: ground truth image (B, 1, H, W)
+            x: low dose image
+            y: ground truth image
             n_iter: training iteration
-            only_adjust_two_step: only use the EMM module in the second stage. Default: False
-            start_adjust_iter: the number of iterations to start training the EMM module. Default: 1
-            dose: [B] - 剂量值 (25, 50等)
-        
-        Returns:
-            x_recon: (B, 1, H, W) - stage I prediction
-            x_mix: (B, C, H, W) - stage I mixed input
-            x_recon_sub1: (B, 1, H, W) - stage II prediction
-            x_mix_sub1: (B, C, H, W) - stage II mixed input
-            out_dist_1: (B, H, W, reg_max+1) - stage I distribution
-            out_dist_2: (B, H, W, reg_max+1) - stage II distribution
-        '''
-
+            text_emb: [B, text_emb_dim] 文本条件（可选）
+        """
         b, c, h, w, device, img_size, = *y.shape, y.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         
@@ -182,15 +166,13 @@ class Diffusion(nn.Module):
 
         # Stage I
         if only_adjust_two_step or n_iter < start_adjust_iter:
-            # 🔥 传入 dose 参数
-            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=False, dose=dose)
+            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=False, text_emb=text_emb)
         else:
             if t[0] == self.num_timesteps - 1:
                 adjust = False
             else:
                 adjust = True
-            # 🔥 传入 dose 参数
-            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=adjust, dose=dose)
+            x_recon, out_dist_1 = self.denoise_fn(x_mix, t, y, x_end, adjust=adjust, text_emb=text_emb)
 
         # Stage II
         if n_iter >= start_adjust_iter and t_single.item() >= 1:
@@ -203,8 +185,7 @@ class Diffusion(nn.Module):
             else:
                 x_mix_sub1 = self.q_sample(x_start=x_recon, x_end=x_end, t=t_sub1)
 
-            # 🔥 传入 dose 参数
-            x_recon_sub1, out_dist_2 = self.denoise_fn(x_mix_sub1, t_sub1, x_recon, x_end, adjust=True, dose=dose)
+            x_recon_sub1, out_dist_2 = self.denoise_fn(x_mix_sub1, t_sub1, x_recon, x_end, adjust=True, text_emb=text_emb)
         else:
             x_recon_sub1, x_mix_sub1 = x_recon, x_mix
             out_dist_2 = out_dist_1

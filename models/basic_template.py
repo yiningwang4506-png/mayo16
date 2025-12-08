@@ -75,15 +75,19 @@ class TrainTask(object):
         parser.add_argument('--dose', type=str, default='10,25',
                             help='dose%% data use for training and testing')
         
-        # 🔥 多设备数据集参数
+        # 多设备数据集参数
         parser.add_argument('--devices', type=str, default='LZU_PH,ZJU_GE,ZJU_UI',
                             help='设备列表，逗号分隔')
         parser.add_argument('--num_test_patients', type=int, default=4,
                             help='每个设备用于测试的患者数量')
 
-        # Dose conditioning 参数
+        # 🔥 Text Condition 参数
         parser.add_argument('--use_text_condition', action='store_true',
-                            help='use dose embedding for multi-dose generalization')
+                            help='use text condition for multi-device/dose')
+        parser.add_argument('--use_bert', action='store_true',
+                            help='use BERT encoder (otherwise use simple encoder)')
+        parser.add_argument('--text_emb_dim', type=int, default=256,
+                            help='text embedding dimension')
 
         return parser
 
@@ -117,33 +121,47 @@ class TrainTask(object):
 
         # 🔥 选择数据集类型
         if opt.train_dataset == 'multi_device':
-            # 使用新的多设备数据集
-            from multi_device_dataset import MultiDeviceDataset
-            DatasetClass = MultiDeviceDataset
-            use_multi_device = True
-            print("✅ Using MultiDeviceDataset")
-        elif opt.use_text_condition:
-            from dose_conditioned_dataset import DoseConditionedCTDataset
-            DatasetClass = DoseConditionedCTDataset
-            use_multi_device = False
-            print("✅ Using Dose-Conditioned dataset")
+            if opt.use_text_condition:
+                # 使用带文本条件的数据集
+                from multi_device_text_dataset import MultiDeviceTextConditionedDataset
+                DatasetClass = MultiDeviceTextConditionedDataset
+                use_text = True
+                print("✅ Using MultiDeviceTextConditionedDataset")
+            else:
+                # 使用普通多设备数据集（Baseline）
+                from multi_device_dataset import MultiDeviceDataset
+                DatasetClass = MultiDeviceDataset
+                use_text = False
+                print("✅ Using MultiDeviceDataset (Baseline)")
         else:
             from utils.dataset import CTDataset
             DatasetClass = CTDataset
-            use_multi_device = False
+            use_text = False
             print("✅ Using standard CTDataset")
 
         # 创建训练集
         if opt.mode == 'train':
-            if use_multi_device:
-                train_dataset = DatasetClass(
-                    data_root=opt.data_root,
-                    mode='train',
-                    devices=device_list,
-                    doses=dose_list,
-                    num_test_patients=opt.num_test_patients,
-                    context=opt.context
-                )
+            if opt.train_dataset == 'multi_device':
+                if use_text:
+                    train_dataset = DatasetClass(
+                        data_root=opt.data_root,
+                        mode='train',
+                        devices=device_list,
+                        doses=dose_list,
+                        num_test_patients=opt.num_test_patients,
+                        context=opt.context,
+                        use_bert=opt.use_bert,
+                        text_emb_dim=opt.text_emb_dim
+                    )
+                else:
+                    train_dataset = DatasetClass(
+                        data_root=opt.data_root,
+                        mode='train',
+                        devices=device_list,
+                        doses=dose_list,
+                        num_test_patients=opt.num_test_patients,
+                        context=opt.context
+                    )
             else:
                 train_dataset = DatasetClass(
                     dataset=opt.train_dataset,
@@ -172,15 +190,27 @@ class TrainTask(object):
             self.train_loader = train_loader
 
         # 创建测试集
-        if use_multi_device:
-            test_dataset = DatasetClass(
-                data_root=opt.data_root,
-                mode='test',
-                devices=device_list,
-                doses=dose_list,
-                num_test_patients=opt.num_test_patients,
-                context=opt.context
-            )
+        if opt.train_dataset == 'multi_device':
+            if use_text:
+                test_dataset = DatasetClass(
+                    data_root=opt.data_root,
+                    mode='test',
+                    devices=device_list,
+                    doses=dose_list,
+                    num_test_patients=opt.num_test_patients,
+                    context=opt.context,
+                    use_bert=opt.use_bert,
+                    text_emb_dim=opt.text_emb_dim
+                )
+            else:
+                test_dataset = DatasetClass(
+                    data_root=opt.data_root,
+                    mode='test',
+                    devices=device_list,
+                    doses=dose_list,
+                    num_test_patients=opt.num_test_patients,
+                    context=opt.context
+                )
         else:
             test_dataset = DatasetClass(
                 dataset=opt.test_dataset,
@@ -235,12 +265,10 @@ class TrainTask(object):
             self.test(opt.test_iter)
             self.generate_images(opt.test_iter)
 
-        # train one-shot learning framework
         elif opt.mode == 'train_osl_framework':
             self.logger.load_test_checkpoints(opt.test_iter)
             self.train_osl_framework(opt.test_iter)
 
-        # test one-shot learning framework
         elif opt.mode == 'test_osl_framework':
             self.logger.load_test_checkpoints(opt.test_iter)
             self.test_osl_framework(opt.test_iter)
@@ -265,34 +293,18 @@ class TrainTask(object):
         pass
 
     # ================================================================
-    # 🔥 修复：适配新数据范围 [0, 4000]
+    # 适配新数据范围 [0, 4000]
     # ================================================================
     
-    # denormalize to [0, 255] for calculating PSNR, SSIM and RMSE
     def transfer_calculate_window(self, img, MIN_B=0, MAX_B=4000, cut_min=0, cut_max=3500):
-        """
-        反归一化并转换到计算窗口
-        
-        新数据格式：
-        - 归一化范围: [0, 1] 对应 [0, 4000]
-        - 计算窗口: [0, 3500] -> [0, 255]
-        """
-        img = img * MAX_B  # 反归一化: [0,1] -> [0, 4000]
+        img = img * MAX_B
         img[img < cut_min] = cut_min
         img[img > cut_max] = cut_max
         img = 255 * (img - cut_min) / (cut_max - cut_min)
         return img
 
-    # denormalize to display window for visualization
     def transfer_display_window(self, img, MIN_B=0, MAX_B=4000, cut_min=500, cut_max=1500):
-        """
-        反归一化并转换到显示窗口
-        
-        新数据格式：
-        - 归一化范围: [0, 1] 对应 [0, 4000]
-        - 显示窗口: 软组织窗 [500, 1500]
-        """
-        img = img * MAX_B  # 反归一化: [0,1] -> [0, 4000]
+        img = img * MAX_B
         img[img < cut_min] = cut_min
         img[img > cut_max] = cut_max
         img = (img - cut_min) / (cut_max - cut_min)
