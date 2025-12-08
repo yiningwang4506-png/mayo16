@@ -1,0 +1,301 @@
+"""
+Multi-Device CT Dataset
+支持多设备、多剂量混合训练的数据集
+适配数据范围 [0, ~3500]
+"""
+import os
+import os.path as osp
+from glob import glob
+from torch.utils.data import Dataset
+import numpy as np
+from functools import partial
+
+
+class MultiDeviceDataset(Dataset):
+    """
+    多设备多剂量混合数据集
+    
+    支持的数据源:
+    - LZU_PH_dose10, LZU_PH_dose25
+    - ZJU_GE_dose10, ZJU_GE_dose25
+    - ZJU_UI_dose10, ZJU_UI_dose25
+    
+    数据范围: [0, ~3500]
+    """
+    
+    def __init__(self, 
+                 data_root='./data',
+                 mode='train',
+                 devices=None,  # ['LZU_PH', 'ZJU_GE', 'ZJU_UI'] 或 None 表示全部
+                 doses=None,    # [10, 25] 或 None 表示全部
+                 test_patients=None,  # 测试集患者ID列表，如 ['P001', 'P002']
+                 num_test_patients=4,  # 每个设备用多少患者做测试
+                 context=True):
+        """
+        Args:
+            data_root: 数据根目录
+            mode: 'train' 或 'test'
+            devices: 使用哪些设备，None表示全部
+            doses: 使用哪些剂量，None表示全部
+            test_patients: 指定测试患者，None则自动选择每个设备最后几个
+            num_test_patients: 每个设备用于测试的患者数量
+            context: 是否使用3帧上下文
+        """
+        self.mode = mode
+        self.context = context
+        self.data_root = data_root
+        
+        # 默认使用所有设备和剂量
+        if devices is None:
+            devices = ['LZU_PH', 'ZJU_GE', 'ZJU_UI']
+        if doses is None:
+            doses = [10, 25]
+        
+        print(f"{'='*60}")
+        print(f"📊 MultiDeviceDataset 初始化")
+        print(f"{'='*60}")
+        print(f"  Mode: {mode}")
+        print(f"  Devices: {devices}")
+        print(f"  Doses: {doses}")
+        print(f"  Context: {context}")
+        
+        self.input_files = []
+        self.target_files = []
+        self.metadata = []  # 存储每个样本的元信息
+        
+        # 遍历每个设备和剂量
+        for device in devices:
+            for dose in doses:
+                # 构建目录路径: data/LZU_PH_dose10/LZU_PH_dose10/
+                dir_name = f"{device}_dose{dose}"
+                data_dir = osp.join(data_root, dir_name, dir_name)
+                
+                if not osp.exists(data_dir):
+                    print(f"  ⚠️ 目录不存在: {data_dir}")
+                    continue
+                
+                # 获取所有患者
+                all_files = sorted(glob(osp.join(data_dir, f"*_dose{dose}.npy")))
+                if not all_files:
+                    print(f"  ⚠️ 没有找到文件: {data_dir}/*_dose{dose}.npy")
+                    continue
+                
+                # 提取患者ID
+                patient_ids = sorted(list(set([
+                    osp.basename(f).split('_')[0] for f in all_files
+                ])))
+                
+                # 划分训练/测试
+                if test_patients is not None:
+                    # 使用指定的测试患者
+                    test_pids = [p for p in test_patients if p in patient_ids]
+                    train_pids = [p for p in patient_ids if p not in test_patients]
+                else:
+                    # 自动划分：最后 num_test_patients 个患者用于测试
+                    test_pids = patient_ids[-num_test_patients:]
+                    train_pids = patient_ids[:-num_test_patients]
+                
+                # 选择当前模式的患者
+                if mode == 'train':
+                    selected_pids = train_pids
+                else:
+                    selected_pids = test_pids
+                
+                # 为每个患者加载数据
+                for pid in selected_pids:
+                    # 获取该患者的所有slice
+                    patient_inputs = sorted(glob(
+                        osp.join(data_dir, f"{pid}_*_dose{dose}.npy")
+                    ))
+                    patient_targets = sorted(glob(
+                        osp.join(data_dir, f"{pid}_*_target.npy")
+                    ))
+                    
+                    if len(patient_inputs) != len(patient_targets):
+                        print(f"  ⚠️ 数量不匹配: {pid} in {dir_name}")
+                        continue
+                    
+                    if len(patient_inputs) < 3:
+                        print(f"  ⚠️ Slice太少: {pid} in {dir_name}")
+                        continue
+                    
+                    # 构建样本（跳过首尾以支持context）
+                    if context:
+                        for i in range(1, len(patient_inputs) - 1):
+                            # 三帧输入
+                            triple = f"{patient_inputs[i-1]}~{patient_inputs[i]}~{patient_inputs[i+1]}"
+                            self.input_files.append(triple)
+                            self.target_files.append(patient_targets[i])
+                            self.metadata.append({
+                                'device': device,
+                                'dose': dose,
+                                'patient': pid,
+                                'slice': i
+                            })
+                    else:
+                        for i in range(1, len(patient_inputs) - 1):
+                            self.input_files.append(patient_inputs[i])
+                            self.target_files.append(patient_targets[i])
+                            self.metadata.append({
+                                'device': device,
+                                'dose': dose,
+                                'patient': pid,
+                                'slice': i
+                            })
+                
+                # 打印统计
+                count = len([m for m in self.metadata 
+                           if m['device'] == device and m['dose'] == dose])
+                print(f"  ✅ {dir_name}: {len(selected_pids)} patients, {count} samples")
+        
+        print(f"{'='*60}")
+        print(f"📊 总计: {len(self.input_files)} 样本")
+        print(f"{'='*60}")
+        
+        # 统计各设备/剂量的样本数
+        self._print_statistics()
+    
+    def _print_statistics(self):
+        """打印数据分布统计"""
+        if not self.metadata:
+            return
+        stats = {}
+        for m in self.metadata:
+            key = f"{m['device']}_dose{m['dose']}"
+            stats[key] = stats.get(key, 0) + 1
+        
+        print("\n📈 样本分布:")
+        for key, count in sorted(stats.items()):
+            pct = count / len(self.metadata) * 100
+            print(f"  {key}: {count} ({pct:.1f}%)")
+    
+    def __getitem__(self, index):
+        input_path = self.input_files[index]
+        target_path = self.target_files[index]
+        
+        # 加载图像
+        if self.context:
+            paths = input_path.split('~')
+            imgs = [np.load(p)[np.newaxis, ...].astype(np.float32) for p in paths]
+            input_img = np.concatenate(imgs, axis=0)  # (3, H, W)
+        else:
+            input_img = np.load(input_path)[np.newaxis, ...].astype(np.float32)
+        
+        target_img = np.load(target_path)[np.newaxis, ...].astype(np.float32)
+        
+        # 归一化
+        input_img = self.normalize_(input_img)
+        target_img = self.normalize_(target_img)
+        
+        return input_img, target_img
+    
+    def __len__(self):
+        return len(self.input_files)
+    
+    def normalize_(self, img, MIN_B=0, MAX_B=4000):
+        """
+        CT值归一化到[0,1]
+        
+        适配新数据格式：
+        - 数据范围: [0, ~3500]
+        - 不需要减1024（数据已经预处理过）
+        """
+        img = np.clip(img, MIN_B, MAX_B)
+        return img / MAX_B
+
+
+# ============================================================
+# 便捷函数
+# ============================================================
+
+def create_multi_device_dataset(data_root='./data',
+                                 mode='train',
+                                 devices=None,
+                                 doses=None,
+                                 num_test_patients=4,
+                                 context=True):
+    """创建多设备数据集的便捷函数"""
+    return MultiDeviceDataset(
+        data_root=data_root,
+        mode=mode,
+        devices=devices,
+        doses=doses,
+        num_test_patients=num_test_patients,
+        context=context
+    )
+
+
+# 预定义的数据集配置
+multi_device_dataset_dict = {
+    'train': partial(create_multi_device_dataset,
+                     data_root='./data',
+                     mode='train',
+                     devices=['LZU_PH', 'ZJU_GE', 'ZJU_UI'],
+                     doses=[10, 25],
+                     num_test_patients=4,
+                     context=True),
+    
+    'test': partial(create_multi_device_dataset,
+                    data_root='./data',
+                    mode='test',
+                    devices=['LZU_PH', 'ZJU_GE', 'ZJU_UI'],
+                    doses=[10, 25],
+                    num_test_patients=4,
+                    context=True),
+}
+
+
+# ============================================================
+# 测试代码
+# ============================================================
+
+if __name__ == '__main__':
+    print("\n" + "="*70)
+    print("🧪 测试 MultiDeviceDataset")
+    print("="*70)
+    
+    # 测试训练集
+    print("\n【训练集】")
+    train_dataset = MultiDeviceDataset(
+        data_root='./data',
+        mode='train',
+        devices=['LZU_PH', 'ZJU_GE', 'ZJU_UI'],
+        doses=[10, 25],
+        num_test_patients=4,
+        context=True
+    )
+    
+    print(f"\n训练集大小: {len(train_dataset)}")
+    
+    # 测试测试集
+    print("\n【测试集】")
+    test_dataset = MultiDeviceDataset(
+        data_root='./data',
+        mode='test',
+        devices=['LZU_PH', 'ZJU_GE', 'ZJU_UI'],
+        doses=[10, 25],
+        num_test_patients=4,
+        context=True
+    )
+    
+    print(f"\n测试集大小: {len(test_dataset)}")
+    
+    # 测试数据加载
+    if len(train_dataset) > 0:
+        print("\n【数据加载测试】")
+        sample = train_dataset[0]
+        print(f"  Input shape: {sample[0].shape}")
+        print(f"  Target shape: {sample[1].shape}")
+        print(f"  Input range: [{sample[0].min():.4f}, {sample[0].max():.4f}]")
+        print(f"  Target range: [{sample[1].min():.4f}, {sample[1].max():.4f}]")
+        
+        # 验证归一化后范围
+        if sample[0].max() <= 1.0 and sample[0].min() >= 0.0:
+            print(f"  ✅ 归一化正确: 范围在 [0, 1]")
+        else:
+            print(f"  ❌ 归一化有问题!")
+        
+        # 显示元信息
+        print(f"\n  样本元信息: {train_dataset.metadata[0]}")
+    
+    print("\n✅ 测试完成！")

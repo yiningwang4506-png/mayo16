@@ -63,17 +63,25 @@ class TrainTask(object):
                             help='patch size used to divide the image')
 
         # dataset
-        parser.add_argument('--train_dataset', type=str, default='mayo_2016_sim')
-        parser.add_argument('--test_dataset', type=str, default='mayo_2016_sim')   # mayo_2020, piglte, phantom, mayo_2016
+        parser.add_argument('--train_dataset', type=str, default='multi_device')
+        parser.add_argument('--test_dataset', type=str, default='multi_device')
+        parser.add_argument('--data_root', type=str, default='./data',
+                            help='数据根目录')
         parser.add_argument('--test_id', type=int, default=9,
                             help='test patient index for Mayo 2016')
         parser.add_argument('--context', action="store_true",
-                            help='use contextual information')   #
+                            help='use contextual information')
         parser.add_argument('--image_size', type=int, default=512)
-        parser.add_argument('--dose', type=str, default='25',
-                            help='dose%% data use for training and testing (comma-separated for mixed training, e.g., "25,50")')
+        parser.add_argument('--dose', type=str, default='10,25',
+                            help='dose%% data use for training and testing')
+        
+        # 🔥 多设备数据集参数
+        parser.add_argument('--devices', type=str, default='LZU_PH,ZJU_GE,ZJU_UI',
+                            help='设备列表，逗号分隔')
+        parser.add_argument('--num_test_patients', type=int, default=4,
+                            help='每个设备用于测试的患者数量')
 
-        # 🔥 Dose conditioning 参数 (复用 use_text_condition 名称以保持兼容)
+        # Dose conditioning 参数
         parser.add_argument('--use_text_condition', action='store_true',
                             help='use dose embedding for multi-dose generalization')
 
@@ -90,40 +98,67 @@ class TrainTask(object):
     def set_loader(self):
         opt = self.opt
 
-        # 解析 dose 参数(统一处理)
+        # 解析 dose 参数
         if isinstance(opt.dose, str):
             dose_list = [int(d.strip()) for d in opt.dose.split(',')]
         elif isinstance(opt.dose, (list, tuple)):
-            dose_list = opt.dose
+            dose_list = list(opt.dose)
         else:
             dose_list = [opt.dose]
         
+        # 解析 devices 参数
+        if isinstance(opt.devices, str):
+            device_list = [d.strip() for d in opt.devices.split(',')]
+        else:
+            device_list = opt.devices
+        
+        print(f"✅ Using devices: {device_list}")
         print(f"✅ Using dose levels: {dose_list}")
 
-        # 🔥 根据是否启用 dose conditioning 选择数据集
-        if opt.use_text_condition:
-            import sys
-            sys.path.append(osp.dirname(osp.dirname(osp.abspath(__file__))))
+        # 🔥 选择数据集类型
+        if opt.train_dataset == 'multi_device':
+            # 使用新的多设备数据集
+            from multi_device_dataset import MultiDeviceDataset
+            DatasetClass = MultiDeviceDataset
+            use_multi_device = True
+            print("✅ Using MultiDeviceDataset")
+        elif opt.use_text_condition:
             from dose_conditioned_dataset import DoseConditionedCTDataset
             DatasetClass = DoseConditionedCTDataset
+            use_multi_device = False
             print("✅ Using Dose-Conditioned dataset")
         else:
             from utils.dataset import CTDataset
             DatasetClass = CTDataset
-            print("✅ Using standard dataset")
+            use_multi_device = False
+            print("✅ Using standard CTDataset")
 
+        # 创建训练集
         if opt.mode == 'train':
-            train_dataset = DatasetClass(
-                dataset=opt.train_dataset,
-                mode='train',
-                test_id=opt.test_id,
-                dose=dose_list,
-                context=opt.context,
-                use_text=opt.use_text_condition if opt.use_text_condition else False,
+            if use_multi_device:
+                train_dataset = DatasetClass(
+                    data_root=opt.data_root,
+                    mode='train',
+                    devices=device_list,
+                    doses=dose_list,
+                    num_test_patients=opt.num_test_patients,
+                    context=opt.context
+                )
+            else:
+                train_dataset = DatasetClass(
+                    dataset=opt.train_dataset,
+                    mode='train',
+                    test_id=opt.test_id,
+                    dose=dose_list,
+                    context=opt.context,
+                )
+            
+            train_sampler = RandomSampler(
+                dataset=train_dataset, 
+                batch_size=opt.batch_size,
+                num_iter=opt.max_iter,
+                restore_iter=opt.resume_iter
             )
-            train_sampler = RandomSampler(dataset=train_dataset, batch_size=opt.batch_size,
-                                          num_iter=opt.max_iter,
-                                          restore_iter=opt.resume_iter)
 
             train_loader = torch.utils.data.DataLoader(
                 dataset=train_dataset,
@@ -136,14 +171,25 @@ class TrainTask(object):
             )
             self.train_loader = train_loader
 
-        test_dataset = DatasetClass(
-            dataset=opt.test_dataset,
-            mode='test',
-            test_id=opt.test_id,
-            dose=dose_list,
-            context=opt.context,
-            use_text=opt.use_text_condition if opt.use_text_condition else False,
-        )
+        # 创建测试集
+        if use_multi_device:
+            test_dataset = DatasetClass(
+                data_root=opt.data_root,
+                mode='test',
+                devices=device_list,
+                doses=dose_list,
+                num_test_patients=opt.num_test_patients,
+                context=opt.context
+            )
+        else:
+            test_dataset = DatasetClass(
+                dataset=opt.test_dataset,
+                mode='test',
+                test_id=opt.test_id,
+                dose=dose_list,
+                context=opt.context,
+            )
+        
         test_loader = torch.utils.data.DataLoader(
             dataset=test_dataset,
             batch_size=opt.test_batch_size,
@@ -153,15 +199,14 @@ class TrainTask(object):
         )
         self.test_loader = test_loader
 
-        # 🔥 处理 test_images（用于可视化）
+        # 处理 test_images（用于可视化）
         test_samples = [test_dataset[i] for i in range(0, min(300, len(test_dataset)), 75)]
         
-        if opt.use_text_condition:
-            # 新格式：dict
+        # 判断返回格式（tuple 还是 dict）
+        if isinstance(test_samples[0], dict):
             low_dose = torch.stack([torch.from_numpy(x['input']) for x in test_samples], dim=0).cuda()
             full_dose = torch.stack([torch.from_numpy(x['target']) for x in test_samples], dim=0).cuda()
         else:
-            # 旧格式：tuple
             low_dose = torch.stack([torch.from_numpy(x[0]) for x in test_samples], dim=0).cuda()
             full_dose = torch.stack([torch.from_numpy(x[1]) for x in test_samples], dim=0).cuda()
         
@@ -219,17 +264,35 @@ class TrainTask(object):
         opt = self.opt
         pass
 
+    # ================================================================
+    # 🔥 修复：适配新数据范围 [0, 4000]
+    # ================================================================
+    
     # denormalize to [0, 255] for calculating PSNR, SSIM and RMSE
-    def transfer_calculate_window(self, img, MIN_B=-1024, MAX_B=3072, cut_min=-1000, cut_max=1000):
-        img = img * (MAX_B - MIN_B) + MIN_B
+    def transfer_calculate_window(self, img, MIN_B=0, MAX_B=4000, cut_min=0, cut_max=3500):
+        """
+        反归一化并转换到计算窗口
+        
+        新数据格式：
+        - 归一化范围: [0, 1] 对应 [0, 4000]
+        - 计算窗口: [0, 3500] -> [0, 255]
+        """
+        img = img * MAX_B  # 反归一化: [0,1] -> [0, 4000]
         img[img < cut_min] = cut_min
         img[img > cut_max] = cut_max
         img = 255 * (img - cut_min) / (cut_max - cut_min)
         return img
 
-    # denormalize to [-100, 200]HU for display
-    def transfer_display_window(self, img, MIN_B=-1024, MAX_B=3072, cut_min=-100, cut_max=200):
-        img = img * (MAX_B - MIN_B) + MIN_B
+    # denormalize to display window for visualization
+    def transfer_display_window(self, img, MIN_B=0, MAX_B=4000, cut_min=500, cut_max=1500):
+        """
+        反归一化并转换到显示窗口
+        
+        新数据格式：
+        - 归一化范围: [0, 1] 对应 [0, 4000]
+        - 显示窗口: 软组织窗 [500, 1500]
+        """
+        img = img * MAX_B  # 反归一化: [0,1] -> [0, 4000]
         img[img < cut_min] = cut_min
         img[img > cut_max] = cut_max
         img = (img - cut_min) / (cut_max - cut_min)
