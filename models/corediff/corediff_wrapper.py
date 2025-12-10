@@ -10,14 +10,15 @@ from FCB import FCB
 
 
 # ============================================================
-# FiLM 层 - 用于注入文本条件
+# FiLM 层 - 用于注入文本条件（改进版）
 # ============================================================
 class FiLMLayer(nn.Module):
     """
-    Feature-wise Linear Modulation
-    用文本条件调制特征图
+    Feature-wise Linear Modulation (改进版)
+    - 添加可学习的残差权重
+    - 更稳定的初始化
     """
-    def __init__(self, cond_dim, feature_dim):
+    def __init__(self, cond_dim, feature_dim, init_scale=0.1):
         super(FiLMLayer, self).__init__()
         
         self.fc = nn.Sequential(
@@ -26,36 +27,36 @@ class FiLMLayer(nn.Module):
             nn.Linear(feature_dim, feature_dim * 2)
         )
         
-        # 初始化：让 gamma 接近 0，beta 接近 0
-        # 这样初始时 FiLM 接近恒等映射
-        nn.init.zeros_(self.fc[2].weight)
+        # 小初始化，让 FiLM 开始时影响较小
+        nn.init.normal_(self.fc[2].weight, std=0.01)
         nn.init.zeros_(self.fc[2].bias)
+        
+        # 🔥 可学习的残差权重，初始化为较小值
+        self.residual_weight = nn.Parameter(torch.tensor(init_scale))
         
         self.feature_dim = feature_dim
 
     def forward(self, x, cond):
-        """
-        Args:
-            x: [B, C, H, W] 特征图
-            cond: [B, cond_dim] 文本条件
-        """
         if cond is None:
             return x
         
         B, C, H, W = x.shape
         
-        params = self.fc(cond)  # [B, C*2]
-        gamma, beta = params.chunk(2, dim=1)  # 各 [B, C]
+        params = self.fc(cond)
+        gamma, beta = params.chunk(2, dim=1)
         
         gamma = gamma.view(B, C, 1, 1)
         beta = beta.view(B, C, 1, 1)
         
-        # FiLM: (1 + gamma) * x + beta
-        return (1 + gamma) * x + beta
+        film_out = (1 + gamma) * x + beta
+        
+        # 残差连接
+        alpha = torch.sigmoid(self.residual_weight)
+        return (1 - alpha) * x + alpha * film_out
 
 
 # ============================================================
-# 基础模块（保持不变）
+# 基础模块
 # ============================================================
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -134,7 +135,7 @@ class adjust_net(nn.Module):
 
 
 # ============================================================
-# UNet（支持 Text Condition）
+# UNet（改进版 Text Condition）
 # ============================================================
 class UNet(nn.Module):
     def __init__(self, in_channels=2, out_channels=1,
@@ -143,7 +144,7 @@ class UNet(nn.Module):
                  y_n=200.0,
                  norm_range_max=3072.0,
                  norm_range_min=-1024.0,
-                 text_emb_dim=None):  # 🔥 新增参数
+                 text_emb_dim=None):
         super(UNet, self).__init__()
 
         self.reg_max = reg_max
@@ -207,12 +208,10 @@ class UNet(nn.Module):
             single_conv(256, 256)
         )
         
-        # 🔥 FiLM 层（如果启用 text condition）
+        # 🔥 改进：只在 bottleneck 注入 FiLM
         if self.use_text_condition:
-            self.film_enc1 = FiLMLayer(text_emb_dim, 128)
-            self.film_bottleneck = FiLMLayer(text_emb_dim, 256)
-            self.film_dec1 = FiLMLayer(text_emb_dim, 128)
-            self.film_dec2 = FiLMLayer(text_emb_dim, 64)
+            self.film_bottleneck = FiLMLayer(text_emb_dim, 256, init_scale=0.1)
+            print(f"✅ FiLM enabled at bottleneck only (init_scale=0.1)")
 
         self.up1 = up(256)
         self.mlp3 = nn.Sequential(
@@ -248,14 +247,6 @@ class UNet(nn.Module):
         self.hu_interval = (y_n - y_0) / self.reg_max
 
     def forward(self, x, t, x_adjust, adjust, text_emb=None):
-        """
-        Args:
-            x: [B, C, H, W] 输入
-            t: [B] 时间步
-            x_adjust: [B, 2, H, W] 调整信号
-            adjust: bool 是否使用 adjust_net
-            text_emb: [B, text_emb_dim] 文本条件（可选）
-        """
         inx = self.inc(x)
         time_emb = self.time_mlp(t)
         
@@ -270,10 +261,6 @@ class UNet(nn.Module):
         else:
             down1 = down1 + condition1
         conv1 = self.conv1(down1)
-        
-        # 🔥 FiLM 注入点 1: encoder
-        if self.use_text_condition and text_emb is not None:
-            conv1 = self.film_enc1(conv1, text_emb)
 
         down2 = self.down2(conv1)
         condition2 = self.mlp2(time_emb)
@@ -291,7 +278,7 @@ class UNet(nn.Module):
         merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)
         conv2 = self.conv2_fusion(merged)
         
-        # 🔥 FiLM 注入点 2: bottleneck（最重要）
+        # 🔥 只在 bottleneck 注入 FiLM
         if self.use_text_condition and text_emb is not None:
             conv2 = self.film_bottleneck(conv2, text_emb)
 
@@ -306,10 +293,6 @@ class UNet(nn.Module):
         else:
             up1 = up1 + condition3
         conv3 = self.conv3(up1)
-        
-        # 🔥 FiLM 注入点 3: decoder
-        if self.use_text_condition and text_emb is not None:
-            conv3 = self.film_dec1(conv3, text_emb)
 
         up2 = self.up2(conv3, inx)
         condition4 = self.mlp4(time_emb)
@@ -321,10 +304,6 @@ class UNet(nn.Module):
         else:
             up2 = up2 + condition4
         conv4 = self.conv4(up2)
-        
-        # 🔥 FiLM 注入点 4: output
-        if self.use_text_condition and text_emb is not None:
-            conv4 = self.film_dec2(conv4, text_emb)
 
         # DRL output
         out = self.outc(conv4)
@@ -342,7 +321,7 @@ class Network(nn.Module):
                  y_n=200.0,
                  norm_range_max=3072.0,
                  norm_range_min=-1024.0,
-                 text_emb_dim=None):  # 🔥 新增
+                 text_emb_dim=None):
         super(Network, self).__init__()
         self.unet = UNet(
             in_channels=in_channels, 
