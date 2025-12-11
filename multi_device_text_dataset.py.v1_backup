@@ -152,8 +152,8 @@ class TextEncoder:
 # ============================================================
 class SimpleTextEncoder:
     """
-    简化版文本编码器 - 完全正交版本 v3
-    每个 (设备, 剂量) 组合都有独立的正交 embedding
+    简化版文本编码器
+    直接用 one-hot 编码设备和剂量
     """
     
     def __init__(self, output_dim=256):
@@ -165,27 +165,14 @@ class SimpleTextEncoder:
         # 剂量编码 (2种)
         self.dose_map = {10: 0, 25: 1}
         
-        # 6 个组合，每个都有独立的正交 embedding
-        # 使用 QR 分解生成 6 个完全正交的向量
+        # 创建固定的 embedding
         np.random.seed(42)
+        self.device_embeddings = np.random.randn(3, output_dim // 2).astype(np.float32)
+        self.dose_embeddings = np.random.randn(2, output_dim // 2).astype(np.float32)
         
-        num_combinations = 6  # 3 devices * 2 doses
-        random_matrix = np.random.randn(output_dim, num_combinations).astype(np.float32)
-        q, _ = np.linalg.qr(random_matrix)
-        
-        # 取前 6 个正交向量，每个作为一个组合的 embedding
-        self.embeddings = q.T[:num_combinations] * 1.5  # [6, output_dim]
-        
-        # 创建组合到索引的映射
-        self.combo_map = {}
-        idx = 0
-        for device in ['LZU_PH', 'ZJU_GE', 'ZJU_UI']:
-            for dose in [10, 25]:
-                self.combo_map[(device, dose)] = idx
-                idx += 1
-        
-        print(f"✅ SimpleTextEncoder (完全正交 v3) initialized, dim={output_dim}")
-        print(f"   6 个组合 embedding 两两正交 (cos ≈ 0)")
+        # 归一化
+        self.device_embeddings /= np.linalg.norm(self.device_embeddings, axis=1, keepdims=True)
+        self.dose_embeddings /= np.linalg.norm(self.dose_embeddings, axis=1, keepdims=True)
         
     def encode(self, device, dose):
         """
@@ -194,8 +181,16 @@ class SimpleTextEncoder:
         Returns:
             np.ndarray: [output_dim]
         """
-        combo_idx = self.combo_map.get((device, dose), 0)
-        return self.embeddings[combo_idx].copy()
+        device_idx = self.device_map.get(device, 0)
+        dose_idx = self.dose_map.get(dose, 0)
+        
+        device_emb = self.device_embeddings[device_idx]
+        dose_emb = self.dose_embeddings[dose_idx]
+        
+        # 拼接
+        text_emb = np.concatenate([device_emb, dose_emb])
+        
+        return text_emb
 
 
 # ============================================================

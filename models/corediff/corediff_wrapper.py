@@ -9,12 +9,13 @@ sys.path.append('.')
 from FCB import FCB
 
 
+
 # ============================================================
-# FiLM 层 - 用于注入文本条件（改进版）
+# FiLM 层 - 用于注入文本条件（改进版 v2）
 # ============================================================
 class FiLMLayer(nn.Module):
     """
-    Feature-wise Linear Modulation (改进版)
+    Feature-wise Linear Modulation (改进版 v2)
     - 添加可学习的残差权重
     - 更稳定的初始化
     """
@@ -27,11 +28,11 @@ class FiLMLayer(nn.Module):
             nn.Linear(feature_dim, feature_dim * 2)
         )
         
-        # 小初始化，让 FiLM 开始时影响较小
-        nn.init.normal_(self.fc[2].weight, std=0.01)
+        # 初始化：std=0.02 比 0.01 稍大，让 FiLM 更快起作用
+        nn.init.normal_(self.fc[2].weight, std=0.02)
         nn.init.zeros_(self.fc[2].bias)
         
-        # 🔥 可学习的残差权重，初始化为较小值
+        # 🔥 可学习的残差权重
         self.residual_weight = nn.Parameter(torch.tensor(init_scale))
         
         self.feature_dim = feature_dim
@@ -53,6 +54,10 @@ class FiLMLayer(nn.Module):
         # 残差连接
         alpha = torch.sigmoid(self.residual_weight)
         return (1 - alpha) * x + alpha * film_out
+    
+    def get_mix_ratio(self):
+        """获取当前混合比例"""
+        return torch.sigmoid(self.residual_weight).item()
 
 
 # ============================================================
@@ -135,7 +140,7 @@ class adjust_net(nn.Module):
 
 
 # ============================================================
-# UNet（改进版 Text Condition）
+# UNet（改进版 v2 - 多层 FiLM 注入）
 # ============================================================
 class UNet(nn.Module):
     def __init__(self, in_channels=2, out_channels=1,
@@ -208,10 +213,12 @@ class UNet(nn.Module):
             single_conv(256, 256)
         )
         
-        # 🔥 改进：只在 bottleneck 注入 FiLM
+        # 🔥 改进 v2：多层 FiLM 注入
         if self.use_text_condition:
-            self.film_bottleneck = FiLMLayer(text_emb_dim, 256, init_scale=0.1)
-            print(f"✅ FiLM enabled at bottleneck only (init_scale=0.1)")
+            self.film_enc1 = FiLMLayer(text_emb_dim, 128, init_scale=0.15)      # encoder 输出
+            self.film_bottleneck = FiLMLayer(text_emb_dim, 256, init_scale=0.25)  # bottleneck
+            self.film_dec1 = FiLMLayer(text_emb_dim, 128, init_scale=0.2)       # decoder 中间
+            print(f"✅ FiLM v2: 多层注入 (enc1=0.15, bottleneck=0.25, dec1=0.2)")
 
         self.up1 = up(256)
         self.mlp3 = nn.Sequential(
@@ -261,6 +268,10 @@ class UNet(nn.Module):
         else:
             down1 = down1 + condition1
         conv1 = self.conv1(down1)
+        
+        # 🔥 FiLM 注入点 1: encoder 输出
+        if self.use_text_condition and text_emb is not None:
+            conv1 = self.film_enc1(conv1, text_emb)
 
         down2 = self.down2(conv1)
         condition2 = self.mlp2(time_emb)
@@ -278,7 +289,7 @@ class UNet(nn.Module):
         merged = torch.cat([spatial_feat, 0.3 * freq_feat], dim=1)
         conv2 = self.conv2_fusion(merged)
         
-        # 🔥 只在 bottleneck 注入 FiLM
+        # 🔥 FiLM 注入点 2: bottleneck
         if self.use_text_condition and text_emb is not None:
             conv2 = self.film_bottleneck(conv2, text_emb)
 
@@ -293,6 +304,10 @@ class UNet(nn.Module):
         else:
             up1 = up1 + condition3
         conv3 = self.conv3(up1)
+        
+        # 🔥 FiLM 注入点 3: decoder 中间
+        if self.use_text_condition and text_emb is not None:
+            conv3 = self.film_dec1(conv3, text_emb)
 
         up2 = self.up2(conv3, inx)
         condition4 = self.mlp4(time_emb)
@@ -312,6 +327,16 @@ class UNet(nn.Module):
         out = out.permute(0, 3, 1, 2)
         
         return out, out_dist
+    
+    def get_film_stats(self):
+        """获取 FiLM 层状态"""
+        if self.use_text_condition:
+            return {
+                'enc1': self.film_enc1.get_mix_ratio(),
+                'bottleneck': self.film_bottleneck.get_mix_ratio(),
+                'dec1': self.film_dec1.get_mix_ratio(),
+            }
+        return {}
 
 
 class Network(nn.Module):
@@ -352,6 +377,10 @@ class Network(nn.Module):
         out = out + x_middle
 
         return out, out_dist
+    
+    def get_film_stats(self):
+        """获取 FiLM 层状态"""
+        return self.unet.get_film_stats()
 
 
 class WeightNet(nn.Module):
